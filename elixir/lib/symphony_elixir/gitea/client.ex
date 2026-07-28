@@ -68,7 +68,10 @@ defmodule SymphonyElixir.Gitea.Client do
   end
 
   defp fetch_by_ids(ids, tracker, fun) do
-    with {:ok, settings} <- settings(tracker), do: ids(Enum.uniq(ids), settings, fun, [])
+    case Enum.uniq(ids) do
+      [] -> {:ok, []}
+      ids -> with {:ok, settings} <- settings(tracker), do: ids(ids, settings, fun, [])
+    end
   end
 
   defp ids([], _, _, acc), do: {:ok, Enum.reverse(acc)}

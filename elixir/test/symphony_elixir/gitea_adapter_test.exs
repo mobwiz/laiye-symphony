@@ -131,6 +131,13 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
              )
   end
 
+  test "client refreshes no IDs without resolving settings" do
+    assert {:ok, []} =
+             GiteaClient.fetch_issues_by_ids_for_test([], %{kind: "gitea", provider: %{}}, fn _, _, _, _, _ ->
+               flunk("empty IDs must not request Gitea")
+             end)
+  end
+
   test "client validates Gitea settings and declares token environments" do
     assert :ok = GiteaClient.validate_settings(tracker_settings())
 
