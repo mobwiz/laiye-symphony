@@ -1,10 +1,10 @@
 defmodule SymphonyElixir.Gitea.AdapterTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.{Config, Tracker, Workflow}
   alias SymphonyElixir.Gitea.Adapter, as: GiteaAdapter
   alias SymphonyElixir.Gitea.AgentTool, as: GiteaAgentTool
   alias SymphonyElixir.Gitea.Client, as: GiteaClient
-  alias SymphonyElixir.{Config, Tracker, Workflow}
 
   defmodule FakeGiteaClient do
     def fetch_issues_by_states(states), do: {:ok, states}

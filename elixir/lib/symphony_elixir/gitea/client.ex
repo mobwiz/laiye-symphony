@@ -59,12 +59,17 @@ defmodule SymphonyElixir.Gitea.Client do
   defp pages(settings, query, requested, page, fun, acc) do
     params = %{"state" => query, "type" => "issues", "page" => page, "limit" => @page_size}
 
-    with {:ok, payload} <- request_result(fun.("GET", path(settings), params, nil, settings), false), true <- is_list(payload) or {:error, :gitea_unknown_payload} do
+    with {:ok, payload} <-
+           request_result(fun.("GET", path(settings), params, nil, settings), false),
+         true <- is_list(payload) or {:error, :gitea_unknown_payload} do
       issues = payload |> Enum.map(&normalize_issue(&1, settings.repo)) |> Enum.reject(&is_nil/1) |> Enum.filter(&MapSet.member?(requested, state(&1.state)))
       malformed = Enum.count(payload, &is_nil(normalize_issue(&1, settings.repo)))
       if malformed > 0, do: Logger.warning("Dropping malformed Gitea issue records count=#{malformed}")
       acc = [issues | acc]
-      if length(payload) < @page_size, do: {:ok, acc |> Enum.reverse() |> List.flatten()}, else: pages(settings, query, requested, page + 1, fun, acc)
+
+      if length(payload) < @page_size,
+        do: {:ok, acc |> Enum.reverse() |> List.flatten()},
+        else: pages(settings, query, requested, page + 1, fun, acc)
     end
   end
 
@@ -84,16 +89,18 @@ defmodule SymphonyElixir.Gitea.Client do
           ids(rest, settings, fun, acc)
 
         %{} ->
-          case normalize_issue(payload, settings.repo) do
-            %Issue{} = issue -> ids(rest, settings, fun, [issue | acc])
-            nil -> {:error, :gitea_unknown_payload}
-          end
+          continue_ids(normalize_issue(payload, settings.repo), rest, settings, fun, acc)
 
         _ ->
           {:error, :gitea_unknown_payload}
       end
     end
   end
+
+  defp continue_ids(%Issue{} = issue, rest, settings, fun, acc),
+    do: ids(rest, settings, fun, [issue | acc])
+
+  defp continue_ids(nil, _rest, _settings, _fun, _acc), do: {:error, :gitea_unknown_payload}
 
   defp request_result({:ok, %{status: status, body: body}}, _) when status in 200..299, do: {:ok, body}
   defp request_result({:ok, %{status: 404}}, true), do: {:ok, :not_found}
@@ -237,7 +244,8 @@ defmodule SymphonyElixir.Gitea.Client do
 
   defp valid_api_url?(value) do
     case URI.parse(value) do
-      %URI{scheme: scheme, host: host, path: path, query: nil, fragment: nil} when scheme in ["http", "https"] and is_binary(host) ->
+      %URI{scheme: scheme, host: host, path: path, query: nil, fragment: nil}
+      when scheme in ["http", "https"] and is_binary(host) ->
         String.ends_with?(String.trim_trailing(path || "", "/"), "/api/v1")
 
       _ ->
