@@ -15,6 +15,9 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
     assert {:error, :invalid_gitea_api_url} =
              GiteaClient.validate_settings(tracker_settings(%{"api_url" => "https://gitea.test"}))
 
+    assert {:error, :invalid_gitea_api_url} =
+             GiteaClient.validate_settings(tracker_settings(%{"api_url" => "https://gitea.test/foo/api/v1/bar"}))
+
     assert :ok =
              GiteaClient.validate_settings(tracker_settings(%{"api_url" => "http://gitea.test/api/v1/"}))
 
