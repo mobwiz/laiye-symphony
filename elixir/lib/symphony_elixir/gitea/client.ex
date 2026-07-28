@@ -93,7 +93,7 @@ defmodule SymphonyElixir.Gitea.Client do
 
   defp valid_api_url?(value) do
     case URI.parse(value) do
-      %URI{scheme: scheme, host: host, path: path} when scheme in ["http", "https"] and is_binary(host) ->
+      %URI{scheme: scheme, host: host, path: path, query: nil, fragment: nil} when scheme in ["http", "https"] and is_binary(host) ->
         String.ends_with?(String.trim_trailing(path || "", "/"), "/api/v1")
 
       _ ->
