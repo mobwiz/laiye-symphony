@@ -4,7 +4,7 @@ defmodule SymphonyElixir.LinearRateLimitTest.LinearClientStub do
   retry flows can simulate RATELIMITED responses deterministically.
   """
 
-  alias SymphonyElixir.Linear.Issue
+  alias SymphonyElixir.Tracker.Issue
 
   @mode_key {__MODULE__, :mode}
   @recipient_key {__MODULE__, :recipient}
@@ -27,7 +27,7 @@ defmodule SymphonyElixir.LinearRateLimitTest.LinearClientStub do
       state: "In Progress",
       labels: [],
       blocked_by: [],
-      assigned_to_worker: true
+      dispatchable: true
     }
   end
 
@@ -41,8 +41,8 @@ defmodule SymphonyElixir.LinearRateLimitTest.LinearClientStub do
     {:ok, []}
   end
 
-  def fetch_issue_states_by_ids(_issue_ids) do
-    notify(:fetch_issue_states_by_ids)
+  def fetch_issues_by_ids(_issue_ids) do
+    notify(:fetch_issues_by_ids)
 
     case mode() do
       :rate_limited_refresh -> {:error, {:linear_rate_limited, 30_000}}
@@ -296,8 +296,7 @@ defmodule SymphonyElixir.LinearRateLimitTest do
     capture_log(fn ->
       send(pid, {:retry_issue, issue.id, next_retry_token})
 
-      assert_receive {:linear_stub, :fetch_candidate_issues}, 2_000
-      assert_receive {:linear_stub, :fetch_issue_states_by_ids}, 2_000
+      assert_receive {:linear_stub, :fetch_issues_by_ids}, 2_000
 
       # Dispatch resumed: either the agent is running, or it already spawned
       # and crashed (fake codex command), scheduling the next retry attempt.
