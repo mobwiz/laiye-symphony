@@ -1,7 +1,12 @@
 defmodule SymphonyElixir.Gitea.Client do
   @moduledoc "Thin Gitea REST client for repository issue polling."
 
+  require Logger
+
   alias SymphonyElixir.Config
+  alias SymphonyElixir.Tracker.Issue
+
+  @page_size 50
 
   @spec validate_settings(map()) :: :ok | {:error, term()}
   def validate_settings(tracker_settings) do
@@ -26,6 +31,141 @@ defmodule SymphonyElixir.Gitea.Client do
       request_fun.(method, path, params, body, gitea_settings)
     end
   end
+
+  @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_states(states), do: fetch_by_states(states, Config.settings!().tracker, &perform_request/5)
+  @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_ids(ids), do: fetch_by_ids(ids, Config.settings!().tracker, &perform_request/5)
+  @doc false
+  @spec normalize_issue_for_test(map(), String.t()) :: Issue.t() | nil
+  def normalize_issue_for_test(issue, repo), do: normalize_issue(issue, repo)
+  @doc false
+  @spec fetch_issues_by_states_for_test([String.t()], map(), function()) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_states_for_test(states, settings, fun), do: fetch_by_states(states, settings, fun)
+  @doc false
+  @spec fetch_issues_by_ids_for_test([String.t()], map(), function()) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_ids_for_test(ids, settings, fun), do: fetch_by_ids(ids, settings, fun)
+
+  defp fetch_by_states(states, tracker, fun) do
+    requested = states |> Enum.map(&state/1) |> MapSet.new()
+
+    case query_state(requested) do
+      nil -> {:ok, []}
+      query -> with {:ok, settings} <- settings(tracker), do: pages(settings, query, requested, 1, fun, [])
+    end
+  end
+
+  defp pages(settings, query, requested, page, fun, acc) do
+    params = %{"state" => query, "type" => "issues", "page" => page, "limit" => @page_size}
+
+    with {:ok, payload} <- request_result(fun.("GET", path(settings), params, nil, settings), false), true <- is_list(payload) or {:error, :gitea_unknown_payload} do
+      issues = payload |> Enum.map(&normalize_issue(&1, settings.repo)) |> Enum.reject(&is_nil/1) |> Enum.filter(&MapSet.member?(requested, state(&1.state)))
+      malformed = Enum.count(payload, &is_nil(normalize_issue(&1, settings.repo)))
+      if malformed > 0, do: Logger.warning("Dropping malformed Gitea issue records count=#{malformed}")
+      acc = [issues | acc]
+      if length(payload) < @page_size, do: {:ok, acc |> Enum.reverse() |> List.flatten()}, else: pages(settings, query, requested, page + 1, fun, acc)
+    end
+  end
+
+  defp fetch_by_ids(ids, tracker, fun) do
+    with {:ok, settings} <- settings(tracker), do: ids(Enum.uniq(ids), settings, fun, [])
+  end
+
+  defp ids([], _, _, acc), do: {:ok, Enum.reverse(acc)}
+
+  defp ids([id | rest], settings, fun, acc) do
+    with {:ok, index} <- index(id), {:ok, payload} <- request_result(fun.("GET", "#{path(settings)}/#{index}", %{}, nil, settings), true) do
+      case payload do
+        :not_found ->
+          ids(rest, settings, fun, acc)
+
+        %{} ->
+          case normalize_issue(payload, settings.repo) do
+            %Issue{} = issue -> ids(rest, settings, fun, [issue | acc])
+            nil -> {:error, :gitea_unknown_payload}
+          end
+
+        _ ->
+          {:error, :gitea_unknown_payload}
+      end
+    end
+  end
+
+  defp request_result({:ok, %{status: status, body: body}}, _) when status in 200..299, do: {:ok, body}
+  defp request_result({:ok, %{status: 404}}, true), do: {:ok, :not_found}
+  defp request_result({:ok, %{status: status}}, _) when is_integer(status), do: {:error, {:gitea_api_status, status}}
+  defp request_result({:error, reason}, _), do: {:error, reason}
+  defp request_result(_, _), do: {:error, :gitea_unknown_payload}
+
+  defp normalize_issue(issue, repo) when is_map(issue) do
+    index = issue["number"] || issue["index"]
+
+    if is_integer(index) and index > 0 and present_string?(issue["title"]) and present_string?(issue["state"]),
+      do: %Issue{
+        id: Integer.to_string(index),
+        native_ref: %{"id" => issue["id"], "index" => index, "repo" => repo} |> Enum.reject(fn {_, value} -> is_nil(value) end) |> Map.new(),
+        identifier: "GT-#{index}",
+        title: issue["title"],
+        description: issue["body"],
+        state: issue["state"],
+        url: issue["html_url"],
+        assignee_id: get_in(issue, ["assignee", "login"]),
+        labels: labels(issue),
+        blocked_by: [],
+        dispatchable: true,
+        created_at: datetime(issue["created_at"]),
+        updated_at: datetime(issue["updated_at"])
+      }
+  end
+
+  defp normalize_issue(_, _), do: nil
+
+  defp labels(%{"labels" => labels}) when is_list(labels),
+    do:
+      labels
+      |> Enum.flat_map(fn
+        %{"name" => name} when is_binary(name) -> [name]
+        _ -> []
+      end)
+      |> Enum.map(&(String.trim(&1) |> String.downcase()))
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.uniq()
+
+  defp labels(_), do: []
+
+  defp datetime(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, date, _} -> date
+      _ -> nil
+    end
+  end
+
+  defp datetime(_), do: nil
+
+  defp path(settings) do
+    repo = settings.repo |> String.split("/", parts: 2) |> Enum.map_join("/", fn segment -> URI.encode(segment, &URI.char_unreserved?/1) end)
+    "/repos/#{repo}/issues"
+  end
+
+  defp query_state(states) do
+    cond do
+      MapSet.member?(states, "open") and MapSet.member?(states, "closed") -> "all"
+      MapSet.member?(states, "open") -> "open"
+      MapSet.member?(states, "closed") -> "closed"
+      true -> nil
+    end
+  end
+
+  defp index(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {value, ""} when value > 0 -> {:ok, value}
+      _ -> {:error, :invalid_gitea_issue_id}
+    end
+  end
+
+  defp index(_), do: {:error, :invalid_gitea_issue_id}
+  defp state(value) when is_binary(value), do: value |> String.trim() |> String.downcase()
+  defp state(_), do: ""
 
   defp settings(tracker_settings) when is_map(tracker_settings) do
     provider = provider_settings(tracker_settings)

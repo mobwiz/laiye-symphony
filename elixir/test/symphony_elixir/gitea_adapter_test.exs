@@ -1,7 +1,135 @@
 defmodule SymphonyElixir.Gitea.AdapterTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.Gitea.Adapter, as: GiteaAdapter
   alias SymphonyElixir.Gitea.Client, as: GiteaClient
+  alias SymphonyElixir.Tracker
+
+  defmodule FakeGiteaClient do
+    def fetch_issues_by_states(states), do: {:ok, states}
+    def fetch_issues_by_ids(ids), do: {:ok, ids}
+  end
+
+  setup do
+    gitea_client_module = Application.get_env(:symphony_elixir, :gitea_client_module)
+
+    on_exit(fn ->
+      if is_nil(gitea_client_module) do
+        Application.delete_env(:symphony_elixir, :gitea_client_module)
+      else
+        Application.put_env(:symphony_elixir, :gitea_client_module, gitea_client_module)
+      end
+    end)
+
+    :ok
+  end
+
+  test "adapter validates states, delegates reads, and is registered" do
+    settings = tracker_settings()
+    assert :ok = GiteaAdapter.validate_config(settings)
+
+    assert {:error, :missing_gitea_active_states} =
+             GiteaAdapter.validate_config(%{settings | active_states: nil})
+
+    assert {:error, :missing_gitea_terminal_states} =
+             GiteaAdapter.validate_config(%{settings | terminal_states: nil})
+
+    assert {:error, :invalid_gitea_states} =
+             GiteaAdapter.validate_config(%{settings | active_states: ["todo"]})
+
+    assert {:error, :invalid_gitea_states} =
+             GiteaAdapter.validate_config(%{settings | terminal_states: ["open"]})
+
+    Application.put_env(:symphony_elixir, :gitea_client_module, FakeGiteaClient)
+    assert {:ok, ["open"]} = GiteaAdapter.fetch_issues_by_states(["open"])
+    assert {:ok, ["42"]} = GiteaAdapter.fetch_issues_by_ids(["42"])
+    assert {:ok, GiteaAdapter} = Tracker.adapter_for_kind("gitea")
+  end
+
+  test "client normalizes Gitea issues" do
+    issue = GiteaClient.normalize_issue_for_test(raw_issue(42), "octo/repo")
+    assert issue.id == "42"
+    assert issue.identifier == "GT-42"
+    assert issue.native_ref == %{"id" => 1_042, "index" => 42, "repo" => "octo/repo"}
+    assert issue.title == "Issue 42"
+    assert issue.description == "Body 42"
+    assert issue.state == "open"
+    assert issue.url == "https://gitea.test/octo/repo/issues/42"
+    assert issue.assignee_id == "octocat"
+    assert issue.labels == ["bug", "platform"]
+    assert issue.blocked_by == []
+    assert issue.dispatchable
+    assert %DateTime{} = issue.created_at
+    assert %DateTime{} = issue.updated_at
+
+    assert GiteaClient.normalize_issue_for_test(Map.put(raw_issue(43), "title", " "), "octo/repo") == nil
+  end
+
+  test "client pages candidate issues with Gitea query parameters" do
+    first_page =
+      Enum.map(1..48, &raw_issue/1) ++
+        [Map.put(raw_issue(49), "state", "closed"), Map.put(raw_issue(50), "title", "")]
+
+    request_fun = fn "GET", "/repos/octo/repo/issues", params, nil, _settings ->
+      send(self(), {:gitea_page, params})
+      body = if params["page"] == 1, do: first_page, else: [raw_issue(51)]
+      {:ok, %{status: 200, body: body}}
+    end
+
+    log =
+      capture_log(fn ->
+        assert {:ok, issues} =
+                 GiteaClient.fetch_issues_by_states_for_test(
+                   [" OPEN "],
+                   tracker_settings(),
+                   request_fun
+                 )
+
+        assert Enum.map(issues, & &1.id) == Enum.map(1..48, &Integer.to_string/1) ++ ["51"]
+      end)
+
+    assert log =~ "Dropping malformed Gitea issue records count=1"
+    assert_receive {:gitea_page, %{"state" => "open", "type" => "issues", "page" => 1, "limit" => 50}}
+    assert_receive {:gitea_page, %{"page" => 2}}
+
+    assert {:ok, []} =
+             GiteaClient.fetch_issues_by_states_for_test(
+               ["todo"],
+               tracker_settings(),
+               fn _, _, _, _, _ -> flunk("unsupported states must not request Gitea") end
+             )
+  end
+
+  test "client refreshes ordered IDs, omits 404s, and rejects malformed records" do
+    request_fun = fn "GET", path, %{}, nil, _settings ->
+      case path do
+        "/repos/octo/repo/issues/2" -> {:ok, %{status: 200, body: raw_issue(2)}}
+        "/repos/octo/repo/issues/1" -> {:ok, %{status: 200, body: raw_issue(1)}}
+        "/repos/octo/repo/issues/404" -> {:ok, %{status: 404, body: %{}}}
+      end
+    end
+
+    assert {:ok, issues} =
+             GiteaClient.fetch_issues_by_ids_for_test(
+               ["2", "1", "404", "2"],
+               tracker_settings(),
+               request_fun
+             )
+
+    assert Enum.map(issues, & &1.id) == ["2", "1"]
+
+    assert {:error, :invalid_gitea_issue_id} =
+             GiteaClient.fetch_issues_by_ids_for_test(["x"], tracker_settings(), request_fun)
+
+    assert {:error, :gitea_unknown_payload} =
+             GiteaClient.fetch_issues_by_ids_for_test(
+               ["3"],
+               tracker_settings(),
+               fn _, _, _, _, _ ->
+                 {:ok, %{status: 200, body: Map.put(raw_issue(3), "state", "")}}
+               end
+             )
+  end
 
   test "client validates Gitea settings and declares token environments" do
     assert :ok = GiteaClient.validate_settings(tracker_settings())
@@ -84,6 +212,21 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
         ),
       active_states: ["open"],
       terminal_states: ["closed"]
+    }
+  end
+
+  defp raw_issue(index) do
+    %{
+      "id" => 1_000 + index,
+      "number" => index,
+      "title" => "Issue #{index}",
+      "body" => "Body #{index}",
+      "state" => "open",
+      "html_url" => "https://gitea.test/octo/repo/issues/#{index}",
+      "assignee" => %{"login" => "octocat"},
+      "labels" => [%{"name" => " Bug "}, %{"name" => "platform"}, %{"name" => "bug"}],
+      "created_at" => "2026-07-28T00:00:00Z",
+      "updated_at" => "2026-07-28T01:00:00Z"
     }
   end
 end
