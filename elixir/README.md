@@ -14,7 +14,7 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 ## How it works
 
 1. Polls the configured tracker for candidate work (included adapters: Linear, GitHub Issues, Jira
-   Cloud, Asana, and GitLab)
+   Cloud, Asana, GitLab, and Gitea)
 2. Creates a workspace per issue
 3. Launches Codex in [App Server mode](https://developers.openai.com/codex/app-server/) inside the
    workspace
@@ -23,9 +23,9 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 
 During app-server sessions, the selected tracker adapter may advertise provider-native tools. The
 Linear serves `linear_graphql`, GitHub Issues serves `github_api`, Jira Cloud serves
-`jira_rest`, Asana serves `asana_api`, and GitLab serves `gitlab_api`. Symphony executes those
-tools with configured host-side auth and removes declared tracker-token environment variables from
-the Codex child, so the agent does not need a second tracker login.
+`jira_rest`, Asana serves `asana_api`, GitLab serves `gitlab_api`, and Gitea serves `gitea_api`.
+Symphony executes those tools with configured host-side auth and removes declared tracker-token
+environment variables from the Codex child, so the agent does not need a second tracker login.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
@@ -255,6 +255,28 @@ codex:
   `body`; Symphony executes it host-side with the session-bound token, strips `GITHUB_TOKEN` and
   configured `$VAR` token names from the Codex child, and leaves raw tool access limited by that
   token's GitHub permissions.
+
+### Gitea adapter
+
+- Config: use `tracker.kind: gitea` with required `tracker.provider.api_url`
+  including `/api/v1`, required `repo` in `owner/repo` form, and `token`
+  (defaults to `GITEA_TOKEN` and accepts `$VAR`). For
+  `https://git.laiye.com`, set `api_url: https://git.laiye.com/api/v1`.
+  Set explicit `active_states: [open]` and `terminal_states: [closed]`.
+- Reads and identity: Symphony polls
+  `/repos/{owner}/{repo}/issues` with `type=issues` in pages of 50, refreshes
+  issues individually by repository-local index, omits inaccessible `404`
+  records, and exposes route-safe `GT-<index>` identifiers.
+- Tool and auth: `gitea_api` accepts GET, POST, PATCH, PUT, and DELETE with a
+  relative REST `path`, optional query `params`, and optional JSON `body`.
+  Symphony executes calls host-side with `Authorization: token`, strips
+  `GITEA_TOKEN` and configured `$VAR` token names from the Codex child, and
+  leaves raw tool access limited only by the Gitea token's permissions.
+- Responsibility and errors: the tool may mutate issues, comments, and pull
+  requests. It adds no retries or idempotency keys, so workflows own safe
+  mutation and rate-limit handling. Configuration, transport, HTTP-status, and
+  malformed-payload failures use the Gitea-specific errors documented by the
+  implementation.
 
 ### Jira Cloud adapter
 
