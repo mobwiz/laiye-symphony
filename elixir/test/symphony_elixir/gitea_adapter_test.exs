@@ -259,6 +259,19 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
            }
   end
 
+  test "gitea_api rejects non-JSON client response bodies" do
+    response =
+      GiteaAgentTool.execute(
+        "gitea_api",
+        %{"method" => "GET", "path" => "/version"},
+        gitea_client: fn _, _, _, _, _ -> {:ok, %{status: 200, body: self()}} end
+      )
+
+    assert response["success"] == false
+    assert %{"error" => %{"message" => message}} = Jason.decode!(response["output"])
+    assert is_binary(message)
+  end
+
   test "gitea_api rejects unsafe calls and reports supported tools" do
     for arguments <- [
           %{"method" => "GET", "path" => "https://gitea.test/api/v1/version"},

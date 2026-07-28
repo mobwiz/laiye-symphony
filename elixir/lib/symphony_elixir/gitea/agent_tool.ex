@@ -81,10 +81,13 @@ defmodule SymphonyElixir.Gitea.AgentTool do
   defp normalize_params(_params), do: {:error, :invalid_params}
 
   defp rest_response(status, body) do
-    dynamic_tool_response(status in 200..299, encode_payload(%{"status" => status, "body" => body}))
+    case encode_payload(%{"status" => status, "body" => body}) do
+      {:ok, output} -> dynamic_tool_response(status in 200..299, output)
+      :error -> failure_response(tool_error_payload(:gitea_unknown_payload))
+    end
   end
 
-  defp failure_response(payload), do: dynamic_tool_response(false, encode_payload(payload))
+  defp failure_response(payload), do: dynamic_tool_response(false, Jason.encode!(payload, pretty: true))
 
   defp dynamic_tool_response(success, output) do
     %{
@@ -96,8 +99,8 @@ defmodule SymphonyElixir.Gitea.AgentTool do
 
   defp encode_payload(payload) do
     case Jason.encode(payload, pretty: true) do
-      {:ok, output} -> output
-      {:error, _reason} -> inspect(payload)
+      {:ok, output} -> {:ok, output}
+      {:error, _reason} -> :error
     end
   end
 
