@@ -3,7 +3,7 @@ defmodule SymphonyElixir.Gitea.Adapter do
 
   @behaviour SymphonyElixir.Tracker
 
-  alias SymphonyElixir.Gitea.Client
+  alias SymphonyElixir.Gitea.{AgentTool, Client}
   alias SymphonyElixir.Tracker.Issue
 
   @active_states ["open"]
@@ -23,6 +23,11 @@ defmodule SymphonyElixir.Gitea.Adapter do
   @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_ids(ids), do: client_module().fetch_issues_by_ids(ids)
 
+  @spec agent_tool_specs() :: [map()]
+  def agent_tool_specs, do: AgentTool.tool_specs()
+
+  @spec execute_agent_tool(String.t(), term(), keyword()) :: map()
+  def execute_agent_tool(tool, arguments, opts), do: AgentTool.execute(tool, arguments, opts)
   @spec secret_environment_names(map()) :: [String.t()]
   def secret_environment_names(settings), do: Client.secret_environment_names(settings)
 

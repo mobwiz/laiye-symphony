@@ -2,8 +2,9 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.Gitea.Adapter, as: GiteaAdapter
+  alias SymphonyElixir.Gitea.AgentTool, as: GiteaAgentTool
   alias SymphonyElixir.Gitea.Client, as: GiteaClient
-  alias SymphonyElixir.Tracker
+  alias SymphonyElixir.{Config, Tracker, Workflow}
 
   defmodule FakeGiteaClient do
     def fetch_issues_by_states(states), do: {:ok, states}
@@ -220,6 +221,80 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
              )
   end
 
+  test "gitea_api forwards writable REST calls and preserves status and body" do
+    response =
+      GiteaAgentTool.execute(
+        "gitea_api",
+        %{
+          "method" => "post",
+          "path" => " /repos/octo/repo/issues/42/comments ",
+          "params" => %{},
+          "body" => %{"body" => "done"}
+        },
+        tracker_settings: tracker_settings(),
+        gitea_client: fn method, path, params, body, opts ->
+          send(self(), {:gitea_tool, method, path, params, body, opts})
+          {:ok, %{status: 201, body: %{"id" => 9}}}
+        end
+      )
+
+    assert_received {:gitea_tool, "POST", "/repos/octo/repo/issues/42/comments", %{}, %{"body" => "done"}, [tracker_settings: _]}
+    assert response["success"] == true
+    assert Jason.decode!(response["output"]) == %{"status" => 201, "body" => %{"id" => 9}}
+
+    failure =
+      GiteaAgentTool.execute(
+        "gitea_api",
+        %{"method" => "GET", "path" => "/repos/octo/repo/issues/404"},
+        gitea_client: fn _, _, _, _, _ ->
+          {:ok, %{status: 404, body: %{"message" => "Not Found"}}}
+        end
+      )
+
+    assert failure["success"] == false
+
+    assert Jason.decode!(failure["output"]) == %{
+             "status" => 404,
+             "body" => %{"message" => "Not Found"}
+           }
+  end
+
+  test "gitea_api rejects unsafe calls and reports supported tools" do
+    for arguments <- [
+          %{"method" => "GET", "path" => "https://gitea.test/api/v1/version"},
+          %{"method" => "OPTIONS", "path" => "/version"},
+          %{"method" => "GET", "path" => "/version", "params" => false},
+          %{"path" => "/version"},
+          "not-an-object"
+        ] do
+      response =
+        GiteaAgentTool.execute("gitea_api", arguments, gitea_client: fn _, _, _, _, _ -> flunk("invalid call reached client") end)
+
+      assert response["success"] == false
+    end
+
+    unsupported = GiteaAgentTool.execute("other", %{}, [])
+    assert Jason.decode!(unsupported["output"])["error"]["supportedTools"] == ["gitea_api"]
+  end
+
+  test "tracker binds Gitea tool and token environment to one session" do
+    token_env = "SYMPHONY_GITEA_BINDING_TOKEN"
+    previous = System.get_env(token_env)
+    System.put_env(token_env, "bound-secret")
+
+    on_exit(fn ->
+      if previous, do: System.put_env(token_env, previous), else: System.delete_env(token_env)
+    end)
+
+    write_gitea_workflow!(Workflow.workflow_file_path(), "$#{token_env}")
+
+    binding = Tracker.bind_agent_tools()
+    assert binding.adapter == GiteaAdapter
+    assert binding.secret_environment_names == ["GITEA_TOKEN", token_env]
+    assert [%{"name" => "gitea_api"}] = binding.tool_specs
+    assert :ok = Config.validate!()
+  end
+
   defp tracker_settings(provider_overrides \\ %{}) do
     %{
       kind: "gitea",
@@ -235,6 +310,30 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
       active_states: ["open"],
       terminal_states: ["closed"]
     }
+  end
+
+  defp write_gitea_workflow!(path, token) do
+    File.write!(
+      path,
+      """
+      ---
+      tracker:
+        kind: gitea
+        provider:
+          api_url: "https://git.laiye.com/api/v1"
+          repo: "octo/repo"
+          token: #{Jason.encode!(token)}
+        active_states: ["open"]
+        terminal_states: ["closed"]
+      ---
+
+      You are working on {{ issue.identifier }}.
+      """
+    )
+
+    if Process.whereis(SymphonyElixir.WorkflowStore) do
+      assert :ok = SymphonyElixir.WorkflowStore.force_reload()
+    end
   end
 
   defp raw_issue(index) do
