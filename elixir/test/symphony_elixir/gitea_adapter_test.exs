@@ -138,6 +138,21 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
              end)
   end
 
+  test "client refreshes no IDs without global settings" do
+    workflow_file = Workflow.workflow_file_path()
+    missing_workflow_file = Path.join(Path.dirname(workflow_file), "missing-workflow.md")
+
+    on_exit(fn ->
+      Workflow.set_workflow_file_path(workflow_file)
+      {:ok, _pid} = Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore)
+    end)
+
+    :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, WorkflowStore)
+    Workflow.set_workflow_file_path(missing_workflow_file)
+
+    assert {:ok, []} = GiteaClient.fetch_issues_by_ids([])
+  end
+
   test "client validates Gitea settings and declares token environments" do
     assert :ok = GiteaClient.validate_settings(tracker_settings())
 

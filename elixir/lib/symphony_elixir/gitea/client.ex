@@ -35,6 +35,7 @@ defmodule SymphonyElixir.Gitea.Client do
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_states(states), do: fetch_by_states(states, Config.settings!().tracker, &perform_request/5)
   @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_ids([]), do: {:ok, []}
   def fetch_issues_by_ids(ids), do: fetch_by_ids(ids, Config.settings!().tracker, &perform_request/5)
   @doc false
   @spec normalize_issue_for_test(map(), String.t()) :: Issue.t() | nil
