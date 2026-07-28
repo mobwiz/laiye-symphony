@@ -66,14 +66,46 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
     assert GiteaClient.normalize_issue_for_test(Map.put(raw_issue(43), "title", " "), "octo/repo") == nil
   end
 
+  test "client safely selects the first nonblank assignee login" do
+    assert GiteaClient.normalize_issue_for_test(
+             raw_issue(1)
+             |> Map.put("assignee", %{"login" => " primary "})
+             |> Map.put("assignees", [%{"login" => "backup"}]),
+             "octo/repo"
+           ).assignee_id == "primary"
+
+    assert GiteaClient.normalize_issue_for_test(
+             raw_issue(2)
+             |> Map.put("assignee", %{"login" => " "})
+             |> Map.put("assignees", [%{}, %{"login" => " backup "}]),
+             "octo/repo"
+           ).assignee_id == "backup"
+
+    assert GiteaClient.normalize_issue_for_test(
+             raw_issue(3)
+             |> Map.put("assignee", "malformed")
+             |> Map.put("assignees", [nil, %{"login" => ""}, %{"login" => 123}]),
+             "octo/repo"
+           ).assignee_id == nil
+  end
+
   test "client pages candidate issues with Gitea query parameters" do
-    first_page =
-      Enum.map(1..48, &raw_issue/1) ++
-        [Map.put(raw_issue(49), "state", "closed"), Map.put(raw_issue(50), "title", "")]
+    first_page = [
+      raw_issue(1),
+      Map.put(raw_issue(2), "state", "closed"),
+      Map.put(raw_issue(3), "title", "")
+    ]
 
     request_fun = fn "GET", "/repos/octo/repo/issues", params, nil, _settings ->
       send(self(), {:gitea_page, params})
-      body = if params["page"] == 1, do: first_page, else: [raw_issue(51)]
+
+      body =
+        case params["page"] do
+          1 -> first_page
+          2 -> [raw_issue(4)]
+          3 -> []
+        end
+
       {:ok, %{status: 200, body: body}}
     end
 
@@ -86,12 +118,13 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
                    request_fun
                  )
 
-        assert Enum.map(issues, & &1.id) == Enum.map(1..48, &Integer.to_string/1) ++ ["51"]
+        assert Enum.map(issues, & &1.id) == ["1", "4"]
       end)
 
     assert log =~ "Dropping malformed Gitea issue records count=1"
     assert_receive {:gitea_page, %{"state" => "open", "type" => "issues", "page" => 1, "limit" => 50}}
     assert_receive {:gitea_page, %{"page" => 2}}
+    assert_receive {:gitea_page, %{"page" => 3}}
 
     assert {:ok, []} =
              GiteaClient.fetch_issues_by_states_for_test(
@@ -99,6 +132,59 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
                tracker_settings(),
                fn _, _, _, _, _ -> flunk("unsupported states must not request Gitea") end
              )
+  end
+
+  test "client rejects repeated nonempty pagination pages" do
+    page = Enum.map(1..50, &raw_issue/1)
+
+    request_fun = fn "GET", "/repos/octo/repo/issues", params, nil, _settings ->
+      send(self(), {:gitea_page, params["page"]})
+
+      case params["page"] do
+        page_number when page_number in [1, 2] -> {:ok, %{status: 200, body: page}}
+        _ -> {:error, :unexpected_third_page}
+      end
+    end
+
+    assert {:error, :gitea_unknown_payload} =
+             GiteaClient.fetch_issues_by_states_for_test(
+               ["open"],
+               tracker_settings(),
+               request_fun
+             )
+
+    assert_receive {:gitea_page, 1}
+    assert_receive {:gitea_page, 2}
+    refute_receive {:gitea_page, 3}
+  end
+
+  test "client fetches closed and combined states exactly" do
+    for {states, query, expected_ids} <- [
+          {["closed"], "closed", ["2"]},
+          {["open", "closed"], "all", ["1", "2"]}
+        ] do
+      request_fun = fn "GET", "/repos/octo/repo/issues", params, nil, _settings ->
+        send(self(), {:gitea_state_page, query, params})
+
+        body =
+          if params["page"] == 1,
+            do: [raw_issue(1), Map.put(raw_issue(2), "state", "closed")],
+            else: []
+
+        {:ok, %{status: 200, body: body}}
+      end
+
+      assert {:ok, issues} =
+               GiteaClient.fetch_issues_by_states_for_test(
+                 states,
+                 tracker_settings(),
+                 request_fun
+               )
+
+      assert Enum.map(issues, & &1.id) == expected_ids
+      assert_receive {:gitea_state_page, ^query, %{"state" => ^query, "type" => "issues", "page" => 1, "limit" => 50}}
+      assert_receive {:gitea_state_page, ^query, %{"page" => 2}}
+    end
   end
 
   test "client refreshes ordered IDs, omits 404s, and rejects malformed records" do
@@ -152,6 +238,21 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
     Workflow.set_workflow_file_path(missing_workflow_file)
 
     assert {:ok, []} = GiteaClient.fetch_issues_by_ids([])
+  end
+
+  test "client fetches no states without global settings" do
+    workflow_file = Workflow.workflow_file_path()
+    missing_workflow_file = Path.join(Path.dirname(workflow_file), "missing-workflow.md")
+
+    on_exit(fn ->
+      Workflow.set_workflow_file_path(workflow_file)
+      {:ok, _pid} = Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore)
+    end)
+
+    :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, WorkflowStore)
+    Workflow.set_workflow_file_path(missing_workflow_file)
+
+    assert {:ok, []} = GiteaClient.fetch_issues_by_states([])
   end
 
   test "client validates Gitea settings and declares token environments" do
@@ -218,6 +319,63 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
                nil,
                tracker_settings: tracker_settings(),
                request_fun: request_fun
+             )
+  end
+
+  test "request disables Req retries and logs only non-success request metadata" do
+    calls = start_supervised!({Agent, fn -> 0 end})
+
+    plug = fn conn ->
+      Agent.update(calls, &(&1 + 1))
+
+      conn
+      |> Plug.Conn.put_status(503)
+      |> Req.Test.json(%{"secret" => "response-body-secret"})
+    end
+
+    log =
+      capture_log(fn ->
+        assert {:ok, %{status: 503}} =
+                 GiteaClient.request(
+                   "GET",
+                   "/version",
+                   %{},
+                   nil,
+                   tracker_settings:
+                     tracker_settings(%{
+                       "api_url" => "http://127.0.0.1:1/api/v1",
+                       "token" => "request-token-secret"
+                     }),
+                   req_options: [plug: plug, retry_delay: 0]
+                 )
+      end)
+
+    assert Agent.get(calls, & &1) == 1
+    assert log =~ "Gitea API request failed status=503 method=GET path=/version"
+    refute log =~ "response-body-secret"
+    refute log =~ "request-token-secret"
+  end
+
+  test "client resolves a referenced token environment" do
+    token_env = "SYMPHONY_GITEA_RESOLUTION_TOKEN"
+    previous = System.get_env(token_env)
+    System.put_env(token_env, "resolved-secret")
+
+    on_exit(fn ->
+      if previous, do: System.put_env(token_env, previous), else: System.delete_env(token_env)
+    end)
+
+    assert {:ok, %{status: 200}} =
+             GiteaClient.request(
+               "GET",
+               "/version",
+               %{},
+               nil,
+               tracker_settings: tracker_settings(%{"token" => "$#{token_env}"}),
+               request_fun: fn _, _, _, _, settings ->
+                 assert settings.token == "resolved-secret"
+                 {:ok, %{status: 200, body: %{}}}
+               end
              )
   end
 

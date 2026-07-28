@@ -24,7 +24,12 @@ defmodule SymphonyElixir.Gitea.Client do
   def request(method, path, params, body, opts \\ [])
       when is_binary(method) and is_binary(path) and is_map(params) and is_list(opts) do
     tracker_settings = Keyword.get_lazy(opts, :tracker_settings, fn -> Config.settings!().tracker end)
-    request_fun = Keyword.get(opts, :request_fun, &perform_request/5)
+    req_options = Keyword.get(opts, :req_options, [])
+
+    request_fun =
+      Keyword.get(opts, :request_fun, fn method, path, params, body, settings ->
+        perform_request(method, path, params, body, settings, req_options)
+      end)
 
     with {:ok, _request_method} <- request_method(method),
          {:ok, gitea_settings} <- settings(tracker_settings) do
@@ -33,6 +38,7 @@ defmodule SymphonyElixir.Gitea.Client do
   end
 
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_states([]), do: {:ok, []}
   def fetch_issues_by_states(states), do: fetch_by_states(states, Config.settings!().tracker, &perform_request/5)
   @spec fetch_issues_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_ids([]), do: {:ok, []}
@@ -52,25 +58,32 @@ defmodule SymphonyElixir.Gitea.Client do
 
     case query_state(requested) do
       nil -> {:ok, []}
-      query -> with {:ok, settings} <- settings(tracker), do: pages(settings, query, requested, 1, fun, [])
+      query -> with {:ok, settings} <- settings(tracker), do: pages(settings, query, requested, 1, fun, [], nil)
     end
   end
 
-  defp pages(settings, query, requested, page, fun, acc) do
+  defp pages(settings, query, requested, page, fun, acc, previous_payload) do
     params = %{"state" => query, "type" => "issues", "page" => page, "limit" => @page_size}
 
     with {:ok, payload} <-
            request_result(fun.("GET", path(settings), params, nil, settings), false),
          true <- is_list(payload) or {:error, :gitea_unknown_payload} do
-      issues = payload |> Enum.map(&normalize_issue(&1, settings.repo)) |> Enum.reject(&is_nil/1) |> Enum.filter(&MapSet.member?(requested, state(&1.state)))
-      malformed = Enum.count(payload, &is_nil(normalize_issue(&1, settings.repo)))
-      if malformed > 0, do: Logger.warning("Dropping malformed Gitea issue records count=#{malformed}")
-      acc = [issues | acc]
-
-      if length(payload) < @page_size,
-        do: {:ok, acc |> Enum.reverse() |> List.flatten()},
-        else: pages(settings, query, requested, page + 1, fun, acc)
+      continue_pages(payload, previous_payload, settings, query, requested, page, fun, acc)
     end
+  end
+
+  defp continue_pages([], _previous, _settings, _query, _requested, _page, _fun, acc),
+    do: {:ok, acc |> Enum.reverse() |> List.flatten()}
+
+  defp continue_pages(payload, payload, _settings, _query, _requested, _page, _fun, _acc),
+    do: {:error, :gitea_unknown_payload}
+
+  defp continue_pages(payload, _previous, settings, query, requested, page, fun, acc) do
+    normalized = Enum.map(payload, &normalize_issue(&1, settings.repo))
+    issues = normalized |> Enum.reject(&is_nil/1) |> Enum.filter(&MapSet.member?(requested, state(&1.state)))
+    malformed = Enum.count(normalized, &is_nil/1)
+    if malformed > 0, do: Logger.warning("Dropping malformed Gitea issue records count=#{malformed}")
+    pages(settings, query, requested, page + 1, fun, [issues | acc], payload)
   end
 
   defp fetch_by_ids(ids, tracker, fun) do
@@ -120,7 +133,7 @@ defmodule SymphonyElixir.Gitea.Client do
         description: issue["body"],
         state: issue["state"],
         url: issue["html_url"],
-        assignee_id: get_in(issue, ["assignee", "login"]),
+        assignee_id: assignee_id(issue),
         labels: labels(issue),
         blocked_by: [],
         dispatchable: true,
@@ -130,6 +143,15 @@ defmodule SymphonyElixir.Gitea.Client do
   end
 
   defp normalize_issue(_, _), do: nil
+
+  defp assignee_id(issue) do
+    candidates = [issue["assignee"] | if(is_list(issue["assignees"]), do: issue["assignees"], else: [])]
+
+    Enum.find_value(candidates, fn
+      %{"login" => login} -> normalize_string(login)
+      _ -> nil
+    end)
+  end
 
   defp labels(%{"labels" => labels}) when is_list(labels),
     do:
@@ -194,27 +216,39 @@ defmodule SymphonyElixir.Gitea.Client do
     end
   end
 
-  defp perform_request(method, path, params, body, settings) do
+  defp perform_request(method, path, params, body, settings),
+    do: perform_request(method, path, params, body, settings, [])
+
+  defp perform_request(method, path, params, body, settings, req_options) do
     with {:ok, request_method} <- request_method(method) do
-      opts = [
-        method: request_method,
-        url: settings.api_url <> path,
-        headers: [
-          {"Accept", "application/json"},
-          {"Authorization", "token #{settings.token}"}
-        ],
-        params: params,
-        connect_options: [timeout: 30_000]
-      ]
+      opts =
+        Keyword.merge(req_options,
+          method: request_method,
+          url: settings.api_url <> path,
+          headers: [
+            {"Accept", "application/json"},
+            {"Authorization", "token #{settings.token}"}
+          ],
+          params: params,
+          connect_options: [timeout: 30_000],
+          retry: false
+        )
 
       opts = if is_nil(body), do: opts, else: Keyword.put(opts, :json, body)
 
-      case Req.request(opts) do
-        {:ok, response} -> {:ok, %{status: response.status, body: response.body}}
-        {:error, reason} -> {:error, {:gitea_api_request, reason}}
-      end
+      opts |> Req.request() |> request_response(method, path)
     end
   end
+
+  defp request_response({:ok, response}, method, path) do
+    if response.status not in 200..299,
+      do: Logger.error("Gitea API request failed status=#{response.status} method=#{method} path=#{path}")
+
+    {:ok, %{status: response.status, body: response.body}}
+  end
+
+  defp request_response({:error, reason}, _method, _path),
+    do: {:error, {:gitea_api_request, reason}}
 
   defp provider_settings(%{provider: provider}) when is_map(provider), do: provider
   defp provider_settings(_tracker_settings), do: %{}

@@ -79,7 +79,9 @@ For requested states:
 3. Select `open`, `closed`, or `all` for Gitea's `state` query.
 4. Request
    `GET /repos/{owner}/{repo}/issues?state=...&type=issues&page=N&limit=50`.
-5. Continue until a response page contains fewer than 50 records.
+5. Continue until the API returns an empty page; Gitea instances may cap a
+   response below the requested limit. Reject a repeated nonempty page as a
+   malformed pagination response.
 6. Normalize records and retain only the exact requested states when the API
    query used `all`.
 
@@ -145,8 +147,8 @@ Successful 2xx responses return `"success": true`. Non-2xx responses preserve
 the status and decoded response body with `"success": false`. Invalid
 arguments, missing configuration, malformed responses, and transport failures
 return a structured JSON error and do not crash or stall the Codex session.
-The tool adds no retries or idempotency keys; workflows own safe mutation and
-rate-limit handling.
+The client adds no retries or idempotency keys; workflows own safe mutation
+and rate-limit handling.
 
 ## Error Handling
 
@@ -176,7 +178,7 @@ Add focused ExUnit coverage for:
 - secret environment name declaration;
 - empty and unsupported state/ID lists avoiding HTTP requests;
 - `open`, `closed`, and combined-state candidate reads;
-- 50-record pagination and exact post-filtering;
+- pagination through an empty page and exact post-filtering;
 - normalization, label cleanup, timestamps, and malformed candidate dropping;
 - ordered ID refresh, duplicate removal, `404` omission, and malformed refresh
   failure;

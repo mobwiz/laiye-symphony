@@ -264,18 +264,19 @@ codex:
   `https://git.laiye.com`, set `api_url: https://git.laiye.com/api/v1`.
   Set explicit `active_states: [open]` and `terminal_states: [closed]`.
 - Reads and identity: Symphony polls
-  `/repos/{owner}/{repo}/issues` with `type=issues` in pages of 50, refreshes
-  issues individually by repository-local index, omits inaccessible `404`
-  records, and exposes route-safe `GT-<index>` identifiers.
+  `/repos/{owner}/{repo}/issues` with `type=issues`, requests pages of 50 until
+  Gitea returns an empty page, refreshes issues individually by repository-local
+  index, omits inaccessible `404` records, and exposes route-safe `GT-<index>`
+  identifiers.
 - Tool and auth: `gitea_api` accepts GET, POST, PATCH, PUT, and DELETE with a
   relative REST `path`, optional query `params`, and optional JSON `body`.
   Symphony executes calls host-side with `Authorization: token`, strips
   `GITEA_TOKEN` and configured `$VAR` token names from the Codex child, and
   leaves raw tool access limited only by the Gitea token's permissions.
 - Responsibility and errors: the tool may mutate issues, comments, and pull
-  requests. It adds no retries or idempotency keys, so workflows own safe
-  mutation and rate-limit handling. Configuration, transport, HTTP-status, and
-  malformed-payload failures use the Gitea-specific errors documented by the
+  requests. The client adds no retries or idempotency keys, so workflows own
+  safe mutation and rate-limit handling. Configuration, transport, HTTP-status,
+  and malformed-payload failures use the Gitea-specific errors documented by the
   implementation.
 
 ### Jira Cloud adapter
