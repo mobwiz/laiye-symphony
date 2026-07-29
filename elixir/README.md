@@ -149,6 +149,10 @@ Notes:
 - `tracker.required_labels` is optional. When set, an issue must have every
   configured label to dispatch or continue running. Label matching ignores
   case and surrounding whitespace. A blank configured label matches no issue.
+- `tracker.active_labels` is optional. An issue matching any configured label
+  is active (OR semantics); an empty list preserves the adapter's existing
+  dispatch behavior. Matching ignores case and surrounding whitespace.
+
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
@@ -264,10 +268,12 @@ codex:
   `https://git.laiye.com`, set `api_url: https://git.laiye.com/api/v1`.
   Set explicit `active_states: [open]` and `terminal_states: [closed]`.
 - Reads and identity: Symphony polls
-  `/repos/{owner}/{repo}/issues` with `type=issues`, requests pages of 50 until
-  Gitea returns an empty page, refreshes issues individually by repository-local
+  `/repos/{owner}/{repo}/issues` with `type=issues`, requests pages of 50 and
+  stops after a short page, refreshes issues individually by repository-local
   index, omits inaccessible `404` records, and exposes route-safe `GT-<index>`
   identifiers.
+- Dispatchability: issues with more than one normalized `status/*` label remain
+  visible but are non-dispatchable.
 - Tool and auth: `gitea_api` accepts GET, POST, PATCH, PUT, and DELETE with a
   relative REST `path`, optional query `params`, and optional JSON `body`.
   Symphony executes calls host-side with `Authorization: token`, strips

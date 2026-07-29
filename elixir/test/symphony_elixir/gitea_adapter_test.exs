@@ -66,6 +66,30 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
     assert GiteaClient.normalize_issue_for_test(Map.put(raw_issue(43), "title", " "), "octo/repo") == nil
   end
 
+  test "client rejects conflicting normalized Gitea status labels" do
+    issue =
+      raw_issue(44)
+      |> Map.put("labels", [%{"name" => "status/todo"}, %{"name" => "Status/Rework"}])
+      |> GiteaClient.normalize_issue_for_test("octo/repo")
+
+    refute issue.dispatchable
+    assert issue.labels == ["status/todo", "status/rework"]
+
+    assert GiteaClient.normalize_issue_for_test(
+             Map.put(raw_issue(45), "labels", [%{"name" => "status/todo"}]),
+             "octo/repo"
+           ).dispatchable
+
+    human_review =
+      GiteaClient.normalize_issue_for_test(
+        Map.put(raw_issue(46), "labels", [%{"name" => "status/human-review"}]),
+        "octo/repo"
+      )
+
+    assert human_review.dispatchable
+    assert human_review.labels == ["status/human-review"]
+  end
+
   test "client safely selects the first nonblank assignee login" do
     assert GiteaClient.normalize_issue_for_test(
              raw_issue(1)

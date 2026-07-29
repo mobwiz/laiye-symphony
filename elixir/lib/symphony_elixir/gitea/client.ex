@@ -127,8 +127,10 @@ defmodule SymphonyElixir.Gitea.Client do
   defp normalize_issue(issue, repo) when is_map(issue) do
     index = issue["number"] || issue["index"]
 
-    if is_integer(index) and index > 0 and present_string?(issue["title"]) and present_string?(issue["state"]),
-      do: %Issue{
+    if is_integer(index) and index > 0 and present_string?(issue["title"]) and present_string?(issue["state"]) do
+      labels = labels(issue)
+
+      %Issue{
         id: Integer.to_string(index),
         native_ref: %{"id" => issue["id"], "index" => index, "repo" => repo} |> Enum.reject(fn {_, value} -> is_nil(value) end) |> Map.new(),
         identifier: "GT-#{index}",
@@ -137,12 +139,13 @@ defmodule SymphonyElixir.Gitea.Client do
         state: issue["state"],
         url: issue["html_url"],
         assignee_id: assignee_id(issue),
-        labels: labels(issue),
+        labels: labels,
         blocked_by: [],
-        dispatchable: true,
+        dispatchable: dispatchable_labels?(labels),
         created_at: datetime(issue["created_at"]),
         updated_at: datetime(issue["updated_at"])
       }
+    end
   end
 
   defp normalize_issue(_, _), do: nil
@@ -168,6 +171,7 @@ defmodule SymphonyElixir.Gitea.Client do
       |> Enum.uniq()
 
   defp labels(_), do: []
+  defp dispatchable_labels?(labels), do: Enum.count(labels, &String.starts_with?(&1, "status/")) <= 1
 
   defp datetime(value) when is_binary(value) do
     case DateTime.from_iso8601(value) do
