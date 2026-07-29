@@ -36,13 +36,23 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
              GiteaAdapter.validate_config(%{settings | terminal_states: nil})
 
     assert {:error, :invalid_gitea_states} =
-             GiteaAdapter.validate_config(%{settings | active_states: ["todo"]})
+             GiteaAdapter.validate_config(%{settings | active_states: ["open"]})
 
     assert {:error, :invalid_gitea_states} =
-             GiteaAdapter.validate_config(%{settings | terminal_states: ["open"]})
+             GiteaAdapter.validate_config(%{settings | active_states: ["state/done"]})
+
+    assert {:error, :invalid_gitea_states} =
+             GiteaAdapter.validate_config(%{settings | terminal_states: ["state/todo"]})
+
+    assert :ok =
+             GiteaAdapter.validate_config(%{
+               settings
+               | active_states: [" STATE/HUMAN-REVIEW "],
+                 terminal_states: [" STATE/DONE "]
+             })
 
     Application.put_env(:symphony_elixir, :gitea_client_module, FakeGiteaClient)
-    assert {:ok, ["open"]} = GiteaAdapter.fetch_issues_by_states(["open"])
+    assert {:ok, ["state/todo"]} = GiteaAdapter.fetch_issues_by_states(["state/todo"])
     assert {:ok, ["42"]} = GiteaAdapter.fetch_issues_by_ids(["42"])
     assert {:ok, GiteaAdapter} = Tracker.adapter_for_kind("gitea")
   end
@@ -54,7 +64,8 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
     assert issue.native_ref == %{"id" => 1_042, "index" => 42, "repo" => "octo/repo"}
     assert issue.title == "Issue 42"
     assert issue.description == "Body 42"
-    assert issue.state == "open"
+    assert issue.state == "state/backlog"
+
     assert issue.url == "https://gitea.test/octo/repo/issues/42"
     assert issue.assignee_id == "octocat"
     assert issue.labels == ["bug", "platform"]
@@ -64,6 +75,75 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
     assert %DateTime{} = issue.updated_at
 
     assert GiteaClient.normalize_issue_for_test(Map.put(raw_issue(43), "title", " "), "octo/repo") == nil
+  end
+
+  test "client derives canonical workflow state from scoped labels" do
+    states = [
+      "state/backlog",
+      "state/todo",
+      "state/in-progress",
+      "state/human-review",
+      "state/rework",
+      "state/merging",
+      "state/canceled",
+      "state/duplicated",
+      "state/done"
+    ]
+
+    for {state, index} <- Enum.with_index(states, 1) do
+      issue =
+        raw_issue(index)
+        |> with_state_labels([" #{String.upcase(state)} "])
+        |> GiteaClient.normalize_issue_for_test("octo/repo")
+
+      assert issue.state == state
+      assert state in issue.labels
+    end
+  end
+
+  test "client defaults missing and unknown state labels to backlog" do
+    missing = GiteaClient.normalize_issue_for_test(raw_issue(20), "octo/repo")
+
+    unknown =
+      raw_issue(21)
+      |> with_state_labels(["state/future"])
+      |> GiteaClient.normalize_issue_for_test("octo/repo")
+
+    assert missing.state == "state/backlog"
+    assert unknown.state == "state/backlog"
+  end
+
+  test "client warns and uses the first recognized state label" do
+    log =
+      capture_log(fn ->
+        issue =
+          raw_issue(22)
+          |> with_state_labels(["state/todo", "state/rework"])
+          |> GiteaClient.normalize_issue_for_test("octo/repo")
+
+        assert issue.state == "state/todo"
+      end)
+
+    assert log =~ "Multiple Gitea state labels issue_index=22 count=2"
+  end
+
+  test "closed issues with nonterminal labels are not dispatchable" do
+    issue =
+      raw_issue(23)
+      |> Map.put("state", "closed")
+      |> with_state_labels(["state/in-progress"])
+      |> GiteaClient.normalize_issue_for_test("octo/repo")
+
+    assert issue.state == "state/in-progress"
+    refute issue.dispatchable
+
+    terminal =
+      raw_issue(24)
+      |> Map.put("state", "closed")
+      |> with_state_labels(["state/done"])
+      |> GiteaClient.normalize_issue_for_test("octo/repo")
+
+    assert terminal.state == "state/done"
   end
 
   test "client safely selects the first nonblank assignee login" do
@@ -91,8 +171,10 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
 
   test "client pages candidate issues with Gitea query parameters" do
     first_page = [
-      raw_issue(1),
-      Map.put(raw_issue(2), "state", "closed"),
+      raw_issue(1) |> with_state_labels(["state/todo"]),
+      raw_issue(2)
+      |> Map.put("state", "closed")
+      |> with_state_labels(["state/done"]),
       Map.put(raw_issue(3), "title", "")
     ]
 
@@ -102,7 +184,7 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
       body =
         case params["page"] do
           1 -> first_page
-          2 -> [raw_issue(4)]
+          2 -> [raw_issue(4) |> with_state_labels(["state/todo"])]
           3 -> []
         end
 
@@ -113,7 +195,7 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
       capture_log(fn ->
         assert {:ok, issues} =
                  GiteaClient.fetch_issues_by_states_for_test(
-                   [" OPEN "],
+                   [" STATE/TODO "],
                    tracker_settings(),
                    request_fun
                  )
@@ -128,14 +210,14 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
 
     assert {:ok, []} =
              GiteaClient.fetch_issues_by_states_for_test(
-               ["todo"],
+               ["state/future"],
                tracker_settings(),
                fn _, _, _, _, _ -> flunk("unsupported states must not request Gitea") end
              )
   end
 
   test "client rejects repeated nonempty pagination pages" do
-    page = Enum.map(1..50, &raw_issue/1)
+    page = Enum.map(1..50, &(raw_issue(&1) |> with_state_labels(["state/todo"])))
 
     request_fun = fn "GET", "/repos/octo/repo/issues", params, nil, _settings ->
       send(self(), {:gitea_page, params["page"]})
@@ -148,7 +230,7 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
 
     assert {:error, :gitea_unknown_payload} =
              GiteaClient.fetch_issues_by_states_for_test(
-               ["open"],
+               ["state/todo"],
                tracker_settings(),
                request_fun
              )
@@ -158,17 +240,22 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
     refute_receive {:gitea_page, 3}
   end
 
-  test "client fetches closed and combined states exactly" do
+  test "client maps requested label states to native Gitea query states" do
     for {states, query, expected_ids} <- [
-          {["closed"], "closed", ["2"]},
-          {["open", "closed"], "all", ["1", "2"]}
+          {["state/todo"], "open", ["1"]},
+          {["state/done"], "closed", ["2"]},
+          {["state/todo", "state/done"], "all", ["1", "2"]}
         ] do
       request_fun = fn "GET", "/repos/octo/repo/issues", params, nil, _settings ->
         send(self(), {:gitea_state_page, query, params})
 
         body =
           if params["page"] == 1,
-            do: [raw_issue(1), Map.put(raw_issue(2), "state", "closed")],
+            do: [
+              raw_issue(1) |> with_state_labels(["state/todo"]),
+              raw_issue(2) |> Map.put("state", "closed") |> with_state_labels(["state/done"]),
+              raw_issue(3) |> with_state_labels(["state/rework"])
+            ],
             else: []
 
         {:ok, %{status: 200, body: body}}
@@ -185,6 +272,27 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
       assert_receive {:gitea_state_page, ^query, %{"state" => ^query, "type" => "issues", "page" => 1, "limit" => 50}}
       assert_receive {:gitea_state_page, ^query, %{"page" => 2}}
     end
+  end
+
+  test "client fetches backlog from open unlabeled issues" do
+    request_fun = fn "GET", _path, params, nil, _settings ->
+      body =
+        if params["page"] == 1,
+          do: [raw_issue(30), raw_issue(31) |> with_state_labels(["state/todo"])],
+          else: []
+
+      {:ok, %{status: 200, body: body}}
+    end
+
+    assert {:ok, [issue]} =
+             GiteaClient.fetch_issues_by_states_for_test(
+               ["state/backlog"],
+               tracker_settings(),
+               request_fun
+             )
+
+    assert issue.id == "30"
+    assert issue.state == "state/backlog"
   end
 
   test "client refreshes ordered IDs, omits 404s, and rejects malformed records" do
@@ -216,6 +324,24 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
                  {:ok, %{status: 200, body: Map.put(raw_issue(3), "state", "")}}
                end
              )
+  end
+
+  test "ID refresh observes label transitions independently of native query polling" do
+    response =
+      raw_issue(40)
+      |> Map.put("state", "closed")
+      |> with_state_labels(["state/done"])
+
+    assert {:ok, [issue]} =
+             GiteaClient.fetch_issues_by_ids_for_test(
+               ["40"],
+               tracker_settings(),
+               fn "GET", "/repos/octo/repo/issues/40", %{}, nil, _settings ->
+                 {:ok, %{status: 200, body: response}}
+               end
+             )
+
+    assert issue.state == "state/done"
   end
 
   test "client refreshes no IDs without resolving settings" do
@@ -478,8 +604,14 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
           },
           provider_overrides
         ),
-      active_states: ["open"],
-      terminal_states: ["closed"]
+      active_states: [
+        "state/backlog",
+        "state/todo",
+        "state/in-progress",
+        "state/rework",
+        "state/merging"
+      ],
+      terminal_states: ["state/canceled", "state/duplicated", "state/done"]
     }
   end
 
@@ -494,8 +626,8 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
           api_url: "https://git.laiye.com/api/v1"
           repo: "octo/repo"
           token: #{Jason.encode!(token)}
-        active_states: ["open"]
-        terminal_states: ["closed"]
+        active_states: ["state/backlog", "state/todo", "state/in-progress", "state/rework", "state/merging"]
+        terminal_states: ["state/canceled", "state/duplicated", "state/done"]
       ---
 
       You are working on {{ issue.identifier }}.
@@ -505,6 +637,17 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
     if Process.whereis(SymphonyElixir.WorkflowStore) do
       assert :ok = SymphonyElixir.WorkflowStore.force_reload()
     end
+  end
+
+  defp with_state_labels(issue, names) do
+    labels =
+      issue["labels"]
+      |> Enum.reject(fn
+        %{"name" => "state/" <> _} -> true
+        _ -> false
+      end)
+
+    Map.put(issue, "labels", labels ++ Enum.map(names, &%{"name" => &1}))
   end
 
   defp raw_issue(index) do

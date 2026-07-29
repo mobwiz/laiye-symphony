@@ -8,6 +8,18 @@ defmodule SymphonyElixir.Gitea.Client do
 
   @page_size 50
 
+  @nonterminal_states MapSet.new([
+                        "state/backlog",
+                        "state/todo",
+                        "state/in-progress",
+                        "state/human-review",
+                        "state/rework",
+                        "state/merging"
+                      ])
+  @terminal_states MapSet.new(["state/canceled", "state/duplicated", "state/done"])
+  @states MapSet.union(@nonterminal_states, @terminal_states)
+  @default_state "state/backlog"
+
   @spec validate_settings(map()) :: :ok | {:error, term()}
   def validate_settings(tracker_settings) do
     with {:ok, _settings} <- settings(tracker_settings), do: :ok
@@ -123,6 +135,9 @@ defmodule SymphonyElixir.Gitea.Client do
 
   defp normalize_issue(issue, repo) when is_map(issue) do
     index = issue["number"] || issue["index"]
+    normalized_labels = labels(issue)
+    workflow_state = issue_state(normalized_labels, index)
+    native_state = state(issue["state"])
 
     if is_integer(index) and index > 0 and present_string?(issue["title"]) and present_string?(issue["state"]),
       do: %Issue{
@@ -131,12 +146,12 @@ defmodule SymphonyElixir.Gitea.Client do
         identifier: "GT-#{index}",
         title: issue["title"],
         description: issue["body"],
-        state: issue["state"],
+        state: workflow_state,
         url: issue["html_url"],
         assignee_id: assignee_id(issue),
-        labels: labels(issue),
+        labels: normalized_labels,
         blocked_by: [],
-        dispatchable: true,
+        dispatchable: native_state == "open" or MapSet.member?(@terminal_states, workflow_state),
         created_at: datetime(issue["created_at"]),
         updated_at: datetime(issue["updated_at"])
       }
@@ -166,6 +181,16 @@ defmodule SymphonyElixir.Gitea.Client do
 
   defp labels(_), do: []
 
+  defp issue_state(labels, index) do
+    states = Enum.filter(labels, &MapSet.member?(@states, &1))
+
+    if length(states) > 1 do
+      Logger.warning("Multiple Gitea state labels issue_index=#{index} count=#{length(states)}")
+    end
+
+    List.first(states, @default_state)
+  end
+
   defp datetime(value) when is_binary(value) do
     case DateTime.from_iso8601(value) do
       {:ok, date, _} -> date
@@ -181,10 +206,13 @@ defmodule SymphonyElixir.Gitea.Client do
   end
 
   defp query_state(states) do
+    terminal? = Enum.any?(states, &MapSet.member?(@terminal_states, &1))
+    nonterminal? = Enum.any?(states, &MapSet.member?(@nonterminal_states, &1))
+
     cond do
-      MapSet.member?(states, "open") and MapSet.member?(states, "closed") -> "all"
-      MapSet.member?(states, "open") -> "open"
-      MapSet.member?(states, "closed") -> "closed"
+      terminal? and nonterminal? -> "all"
+      terminal? -> "closed"
+      nonterminal? -> "open"
       true -> nil
     end
   end
