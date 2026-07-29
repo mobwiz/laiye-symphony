@@ -262,17 +262,42 @@ codex:
   including `/api/v1`, required `repo` in `owner/repo` form, and `token`
   (defaults to `GITEA_TOKEN` and accepts `$VAR`). For
   `https://git.laiye.com`, set `api_url: https://git.laiye.com/api/v1`.
-  Set explicit `active_states: [open]` and `terminal_states: [closed]`.
+  Set explicit workflow labels:
+
+  ```yaml
+  active_states:
+    - state/backlog
+    - state/todo
+    - state/in-progress
+    - state/rework
+    - state/merging
+  terminal_states:
+    - state/canceled
+    - state/duplicated
+    - state/done
+  ```
+
+  `state/human-review` is recognized but intentionally outside both lists, so
+  agents stop without workspace cleanup.
 - Reads and identity: Symphony polls
   `/repos/{owner}/{repo}/issues` with `type=issues`, requests pages of 50 until
   Gitea returns an empty page, refreshes issues individually by repository-local
   index, omits inaccessible `404` records, and exposes route-safe `GT-<index>`
-  identifiers.
+  identifiers. Symphony derives `issue.state` from the exclusive scoped labels
+  `state/backlog`, `state/todo`, `state/in-progress`, `state/human-review`,
+  `state/rework`, `state/merging`, `state/canceled`, `state/duplicated`, and
+  `state/done`; missing or unknown state labels default to `state/backlog`.
+  Nonterminal state reads query open Gitea issues, terminal state reads query
+  closed issues, and mixed reads query all issues before exact label-state
+  filtering. A closed issue carrying a nonterminal label is not dispatchable.
 - Tool and auth: `gitea_api` accepts GET, POST, PATCH, PUT, and DELETE with a
   relative REST `path`, optional query `params`, and optional JSON `body`.
   Symphony executes calls host-side with `Authorization: token`, strips
   `GITEA_TOKEN` and configured `$VAR` token names from the Codex child, and
-  leaves raw tool access limited only by the Gitea token's permissions.
+  leaves raw tool access limited only by the Gitea token's permissions. Workflows
+  replace the scoped state label through `gitea_api`; after verification, apply
+  `state/canceled`, `state/duplicated`, or `state/done` and close the Gitea
+  issue. Reopening also requires changing to a nonterminal label.
 - Responsibility and errors: the tool may mutate issues, comments, and pull
   requests. The client adds no retries or idempotency keys, so workflows own
   safe mutation and rate-limit handling. Configuration, transport, HTTP-status,
