@@ -67,13 +67,21 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
   end
 
   test "client rejects conflicting normalized Gitea status labels" do
-    issue =
-      raw_issue(44)
-      |> Map.put("labels", [%{"name" => "status/todo"}, %{"name" => "Status/Rework"}])
-      |> GiteaClient.normalize_issue_for_test("octo/repo")
+    log =
+      capture_log([metadata: [:repository, :issue_index, :status_labels]], fn ->
+        issue =
+          raw_issue(44)
+          |> Map.put("labels", [%{"name" => "status/todo"}, %{"name" => "Status/Rework"}])
+          |> GiteaClient.normalize_issue_for_test("octo/repo")
 
-    refute issue.dispatchable
-    assert issue.labels == ["status/todo", "status/rework"]
+        refute issue.dispatchable
+        assert issue.labels == ["status/todo", "status/rework"]
+      end)
+
+    assert log =~ "Rejecting Gitea issue with conflicting status labels"
+    assert log =~ "repository=octo/repo"
+    assert log =~ "issue_index=44"
+    assert log =~ ~s(status_labels=["status/todo", "status/rework"])
 
     assert GiteaClient.normalize_issue_for_test(
              Map.put(raw_issue(45), "labels", [%{"name" => "status/todo"}]),

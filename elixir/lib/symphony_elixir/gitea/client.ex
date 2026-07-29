@@ -141,7 +141,7 @@ defmodule SymphonyElixir.Gitea.Client do
         assignee_id: assignee_id(issue),
         labels: labels,
         blocked_by: [],
-        dispatchable: dispatchable_labels?(labels),
+        dispatchable: dispatchable_labels?(labels, repo, index),
         created_at: datetime(issue["created_at"]),
         updated_at: datetime(issue["updated_at"])
       }
@@ -171,7 +171,22 @@ defmodule SymphonyElixir.Gitea.Client do
       |> Enum.uniq()
 
   defp labels(_), do: []
-  defp dispatchable_labels?(labels), do: Enum.count(labels, &String.starts_with?(&1, "status/")) <= 1
+
+  defp dispatchable_labels?(labels, repo, index) do
+    status_labels = Enum.filter(labels, &String.starts_with?(&1, "status/"))
+
+    if length(status_labels) > 1 do
+      Logger.warning("Rejecting Gitea issue with conflicting status labels",
+        repository: repo,
+        issue_index: index,
+        status_labels: inspect(status_labels)
+      )
+
+      false
+    else
+      true
+    end
+  end
 
   defp datetime(value) when is_binary(value) do
     case DateTime.from_iso8601(value) do
