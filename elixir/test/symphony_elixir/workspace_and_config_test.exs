@@ -428,16 +428,21 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     refute issue.dispatchable
   end
 
-  test "tracker issue routing requires every configured label" do
-    issue = %Issue{labels: [" Symphony ", "JavaScript"], dispatchable: true}
+  test "tracker issue routing requires every configured label and an active label" do
+    issue = %Issue{labels: ["backend", "status/todo"], dispatchable: true}
 
-    assert Issue.routable?(issue, [])
-    assert Issue.routable?(issue, ["symphony"])
-    assert Issue.routable?(issue, ["SYMPHONY", "javascript"])
-    refute Issue.routable?(issue, ["symph"])
-    refute Issue.routable?(issue, [" "])
-    refute Issue.routable?(issue, ["symphony", "security"])
-    refute Issue.routable?(%{issue | dispatchable: false}, ["symphony"])
+    assert Issue.routable?(issue, [], [])
+    assert Issue.routable?(issue, [], ["status/todo", "status/rework"])
+    assert Issue.routable?(issue, ["backend"], ["status/todo"])
+    refute Issue.routable?(issue, [], ["status/merging"])
+    refute Issue.routable?(issue, ["missing"], ["status/todo"])
+    refute Issue.routable?(%{issue | dispatchable: false}, [], ["status/todo"])
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_labels: [" Status/Todo ", "STATUS/TODO", "status/rework"]
+    )
+
+    assert Config.settings!().tracker.active_labels == ["status/todo", "status/rework"]
   end
 
   test "linear client normalizes blockers from inverse relations" do

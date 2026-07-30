@@ -911,6 +911,51 @@ defmodule SymphonyElixir.CoreTest do
     refute Process.alive?(agent_pid)
   end
 
+  test "reconcile stops running issue when its active label changes" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["open"],
+      tracker_active_labels: ["status/todo", "status/in-progress"]
+    )
+
+    issue_id = "issue-active-label-changed"
+
+    agent_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: agent_pid,
+          ref: nil,
+          identifier: "MT-562-active",
+          issue: %Issue{id: issue_id, identifier: "MT-562-active", state: "open", labels: ["status/todo"]},
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    refreshed_issue = %Issue{
+      id: issue_id,
+      identifier: "MT-562-active",
+      state: "open",
+      title: "Human review",
+      labels: ["status/human-review"],
+      dispatchable: true
+    }
+
+    updated_state = Orchestrator.reconcile_issue_states_for_test([refreshed_issue], state)
+
+    refute Map.has_key?(updated_state.running, issue_id)
+    refute Process.alive?(agent_pid)
+  end
+
   test "reconcile releases a blocked issue when a required label is removed" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_required_labels: ["symphony"])
 
@@ -968,6 +1013,29 @@ defmodule SymphonyElixir.CoreTest do
 
     refute MapSet.member?(updated_state.claimed, issue_id)
     refute Map.has_key?(updated_state.retry_attempts, issue_id)
+  end
+
+  test "dispatches only issues with an active label" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["open"],
+      tracker_active_labels: ["status/todo", "status/in-progress"]
+    )
+
+    state = %Orchestrator.State{claimed: MapSet.new(), running: %{}, blocked: %{}}
+
+    todo_issue = %Issue{
+      id: "issue-status-todo",
+      identifier: "MT-565-todo",
+      title: "Todo",
+      state: "open",
+      labels: ["status/todo"],
+      dispatchable: true
+    }
+
+    review_issue = %{todo_issue | id: "issue-status-review", labels: ["status/human-review"]}
+
+    assert Orchestrator.should_dispatch_issue_for_test(todo_issue, state)
+    refute Orchestrator.should_dispatch_issue_for_test(review_issue, state)
   end
 
   test "retry releases its claim when dispatch revalidation no longer finds the issue" do
@@ -1031,6 +1099,27 @@ defmodule SymphonyElixir.CoreTest do
 
     refreshed_issue = %{issue | labels: []}
     fetcher = fn ["issue-label-continuation"] -> {:ok, [refreshed_issue]} end
+
+    assert {:done, ^refreshed_issue} =
+             AgentRunner.continue_with_issue_for_test(issue, fetcher)
+  end
+
+  test "agent runner does not continue after its active label changes" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["open"],
+      tracker_active_labels: ["status/todo", "status/in-progress"]
+    )
+
+    issue = %Issue{
+      id: "issue-active-label-continuation",
+      identifier: "MT-563-active",
+      title: "Stop after active-label change",
+      state: "open",
+      labels: ["status/todo"]
+    }
+
+    refreshed_issue = %{issue | labels: ["status/human-review"], dispatchable: true}
+    fetcher = fn ["issue-active-label-continuation"] -> {:ok, [refreshed_issue]} end
 
     assert {:done, ^refreshed_issue} =
              AgentRunner.continue_with_issue_for_test(issue, fetcher)

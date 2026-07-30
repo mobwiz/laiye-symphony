@@ -877,7 +877,8 @@ defmodule SymphonyElixir.Orchestrator do
   defp candidate_issue?(_issue, _active_states, _terminal_states), do: false
 
   defp issue_routable?(%Issue{} = issue) do
-    Issue.routable?(issue, Config.settings!().tracker.required_labels)
+    tracker = Config.settings!().tracker
+    Issue.routable?(issue, tracker.required_labels, tracker.active_labels)
   end
 
   defp terminal_issue_state?(state_name, terminal_states) when is_binary(state_name) do
