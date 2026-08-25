@@ -101,6 +101,24 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
     end
   end
 
+  test "adapter and client support symphony scoped states" do
+    settings = %{
+      tracker_settings()
+      | active_states: ["symphony/todo"],
+        terminal_states: ["symphony/done"]
+    }
+
+    assert :ok = GiteaAdapter.validate_config(settings)
+
+    request_fun = fn "GET", "/repos/octo/repo/issues", params, nil, _settings ->
+      body = if params["page"] == 1, do: [raw_issue(1) |> with_state_labels(["symphony/todo"])], else: []
+      {:ok, %{status: 200, body: body}}
+    end
+
+    assert {:ok, [%{state: "symphony/todo"}]} =
+             GiteaClient.fetch_issues_by_states_for_test(["symphony/todo"], settings, request_fun)
+  end
+
   test "client defaults missing and unknown state labels to backlog" do
     missing = GiteaClient.normalize_issue_for_test(raw_issue(20), "octo/repo")
 
@@ -643,8 +661,11 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
     labels =
       issue["labels"]
       |> Enum.reject(fn
-        %{"name" => "state/" <> _} -> true
-        _ -> false
+        %{"name" => name} when is_binary(name) ->
+          String.starts_with?(name, ["state/", "symphony/"])
+
+        _ ->
+          false
       end)
 
     Map.put(issue, "labels", labels ++ Enum.map(names, &%{"name" => &1}))

@@ -6,15 +6,13 @@ defmodule SymphonyElixir.Gitea.Adapter do
   alias SymphonyElixir.Gitea.{AgentTool, Client}
   alias SymphonyElixir.Tracker.Issue
 
-  @active_states [
-    "state/backlog",
-    "state/todo",
-    "state/in-progress",
-    "state/human-review",
-    "state/rework",
-    "state/merging"
-  ]
-  @terminal_states ["state/canceled", "state/duplicated", "state/done"]
+  @state_prefixes ["state", "symphony"]
+  @active_states for prefix <- @state_prefixes,
+                     state <- ["backlog", "todo", "in-progress", "human-review", "rework", "merging"],
+                     do: "#{prefix}/#{state}"
+  @terminal_states for prefix <- @state_prefixes,
+                       state <- ["canceled", "duplicated", "done"],
+                       do: "#{prefix}/#{state}"
 
   @spec validate_config(map()) :: :ok | {:error, term()}
   def validate_config(settings) do

@@ -8,15 +8,17 @@ defmodule SymphonyElixir.Gitea.Client do
 
   @page_size 50
 
-  @nonterminal_states MapSet.new([
-                        "state/backlog",
-                        "state/todo",
-                        "state/in-progress",
-                        "state/human-review",
-                        "state/rework",
-                        "state/merging"
-                      ])
-  @terminal_states MapSet.new(["state/canceled", "state/duplicated", "state/done"])
+  @state_prefixes ["state", "symphony"]
+  @nonterminal_states MapSet.new(
+                        for prefix <- @state_prefixes,
+                            state <- ["backlog", "todo", "in-progress", "human-review", "rework", "merging"],
+                            do: "#{prefix}/#{state}"
+                      )
+  @terminal_states MapSet.new(
+                     for prefix <- @state_prefixes,
+                         state <- ["canceled", "duplicated", "done"],
+                         do: "#{prefix}/#{state}"
+                   )
   @states MapSet.union(@nonterminal_states, @terminal_states)
   @default_state "state/backlog"
 
