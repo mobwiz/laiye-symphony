@@ -2309,3 +2309,19 @@ Extension config:
 - Cleanup and observability:
   - Operators need to know which host owns a run, where its workspace lives, and whether cleanup
     happened on the right machine.
+
+### Optional local preset workspace extension
+
+An implementation may support `workspace.mode: preset`, with a list of single directory names in
+`workspace.environments` under `workspace.root`. Default mode remains per-issue workspace creation.
+Preset directories are prebuilt and exclusively assigned to issues, with durable identity/path
+records across retries, inactive review states and restarts. Pool exhaustion leaves work pending
+without starting an agent. Removal from the configured pool prevents new allocation but retains
+existing ownership and terminal cleanup obligations.
+
+Preset preparation and terminal handoff use `dev/job.sh prepare <job-id>` and
+`dev/job.sh cleanup <job-id> --terminal`. Success requires matching persisted job ownership and
+ready/released state, not only an exit code. Preparation and cleanup failures retain ownership.
+Only verified terminal handoff frees an environment; ordinary attempt completion does not.
+All cleanup routes must preserve preset directories and their contents, including when handling
+recorded paths or startup terminal reconciliation. Existing per-issue/remote behavior is unchanged.

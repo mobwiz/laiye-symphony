@@ -1,1 +1,4 @@
 .worktrees/
+
+# Local durable preset ownership
+.symphony-preset-pool.json*

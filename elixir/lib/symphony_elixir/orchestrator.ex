@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, PresetPool, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -257,6 +257,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_dispatch(%State{} = state) do
+    reconcile_preset_cleanup(state)
+
     state =
       state
       |> reconcile_running_issues()
@@ -946,6 +948,29 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
+    reservation =
+      if PresetPool.enabled?() or PresetPool.assigned?(issue) do
+        PresetPool.reserve(issue)
+      else
+        {:ok, nil}
+      end
+
+    case reservation do
+      {:ok, _path} ->
+        dispatch_reserved_issue(state, issue, attempt, preferred_worker_host)
+
+      {:error, reason} ->
+        Logger.info("Waiting for preset environment #{issue_context(issue)} reason=#{inspect(reason)}")
+
+        if attempt do
+          schedule_issue_retry(state, issue.id, attempt, %{identifier: issue.identifier, error: inspect(reason), worker_host: preferred_worker_host})
+        else
+          state
+        end
+    end
+  end
+
+  defp dispatch_reserved_issue(%State{} = state, issue, attempt, preferred_worker_host) do
     recipient = self()
 
     case select_worker_host(state, preferred_worker_host) do
@@ -1167,6 +1192,26 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp cleanup_issue_workspace(_issue_or_identifier, _worker_host), do: :ok
+
+  defp reconcile_preset_cleanup(state) do
+    ids = PresetPool.records() |> Map.values() |> Enum.map(& &1["issue_id"])
+
+    if ids != [] do
+      case Tracker.fetch_issues_by_ids(ids) do
+        {:ok, issues} ->
+          Enum.each(issues, &cleanup_terminal_preset(&1, state))
+
+        {:error, reason} ->
+          Logger.warning("Preset cleanup reconciliation failed: #{inspect(reason)}")
+      end
+    end
+  end
+
+  defp cleanup_terminal_preset(issue, state) do
+    if terminal_issue_state?(issue.state, terminal_state_set()) and not Map.has_key?(state.running, issue.id) do
+      PresetPool.release_issue(issue)
+    end
+  end
 
   defp run_terminal_workspace_cleanup do
     case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
@@ -1495,6 +1540,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     {:reply,
      %{
+       preset_environments: Map.values(PresetPool.records()),
        running: running,
        retrying: retrying,
        blocked: blocked,

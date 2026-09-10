@@ -121,12 +121,18 @@ defmodule SymphonyElixir.Config.Schema do
     @primary_key false
     embedded_schema do
       field(:root, :string, default: Path.join(System.tmp_dir!(), "symphony_workspaces"))
+      field(:mode, :string, default: "per_issue")
+      field(:environments, {:array, :string}, default: [])
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:root], empty_values: [])
+      |> cast(attrs, [:root, :mode, :environments], empty_values: [])
+      |> validate_inclusion(:mode, ["per_issue", "preset"])
+      |> validate_change(:environments, fn :environments, names ->
+        if Enum.uniq(names) == names and Enum.all?(names, &Regex.match?(~r/\A[A-Za-z0-9][A-Za-z0-9_-]*\z/, &1)), do: [], else: [environments: "must contain unique single directory names"]
+      end)
     end
   end
 

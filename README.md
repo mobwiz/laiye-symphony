@@ -39,3 +39,10 @@ help with the setup:
 ## License
 
 This project is licensed under the [Apache License 2.0](LICENSE).
+
+### Persistent preset environments
+
+The Elixir implementation optionally assigns prebuilt local environments instead of cloning a
+workspace for each issue. An issue keeps its environment through retries, review and restarts;
+terminal cleanup releases ownership without deleting the directory. See
+[the preset configuration and lifecycle contract](elixir/README.md#preset-environment-pool).

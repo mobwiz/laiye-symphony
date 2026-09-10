@@ -445,3 +445,52 @@ you.
 ## License
 
 This project is licensed under the [Apache License 2.0](../LICENSE).
+
+## Preset environment pool
+
+Use this optional local mode for a single Symphony instance managing stable, prebuilt environments:
+
+```yaml
+workspace:
+  mode: preset
+  root: ~/Workspaces
+  environments:
+    - apa-02
+```
+
+Names are unique single directory names, resolved under `root`; paths, `..` and separators are
+rejected. Directories must already exist with `dev/job.sh`, `.environment/runtime.env`,
+`.environment/repositories.json`, and `.environment/provisioned.json`. Symlinked environments are
+rejected. No repository cloning, dependency installation or data restoration occurs in this mode.
+Omitting `mode` retains the existing `per_issue` behavior. SSH workers are not supported in preset mode.
+
+Allocation follows existing issue priority. When the pool is full, no agent is started; candidates
+remain eligible for the next poll. An assigned issue resumes its same environment even if its name
+has been removed from `environments`. Existing manual ownership in `.environment/job.json` prevents
+allocation. Only one Symphony instance may manage a pool; cross-instance leasing is not implemented.
+
+Assignments live in `.symphony-preset-pool.json` beside the selected workflow file, with private
+permissions and atomic replacement. Keep this file across restarts and outside Git. It contains
+issue identity, environment path, job identifier and lifecycle phase. Do not remove or move the
+workflow/ledger while environments are occupied. Changing tracker scope with active assignments
+blocks new allocation and cleanup; restore the original scope before completing the handoff.
+The orchestrator snapshot includes `preset_environments` for assignment and cleanup-failure diagnostics.
+
+Before each agent attempt, Symphony calls `dev/job.sh prepare <job-id>`. A successful exit must be
+accompanied by a matching `job.json` with phase `ready`. Failed preparation keeps the reservation.
+The script must handle retries idempotently and keep environment data/code safe.
+
+Terminal reconciliation stops the task agent, calls `dev/job.sh cleanup <job-id> --terminal`, and
+requires both exit 0 and a matching `released` job state before freeing the reservation. Cleanup
+failure remains recorded and is retried by subsequent polling, including after a restart. A task
+canceled before preparation releases only its unused reservation. Preset directories are never
+recursively deleted, including recorded-path and startup cleanup paths. Manual, unowned presets
+are not automatically cleaned up. Removing an occupied environment from configuration does not
+remove the record or authorize deletion.
+
+Preset environments bypass the ordinary `after_create`, `before_run`, `after_run` and `before_remove`
+hooks; their lifecycle is owned by `job.sh`. In particular, `after_run` is per attempt, not terminal.
+Do not retain legacy bootstrap instructions in the preset workflow prompt. Load runtime addresses
+and credentials through the environment's own wrappers; do not assume a fresh checkout or fixed ports.
+Switch the workflow only after existing active tasks have been accounted for. The shipped workflow
+continues to use per-issue mode; the snippet above is an opt-in configuration.

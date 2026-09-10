@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Workspace do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, PathSafety, SSH}
+  alias SymphonyElixir.{Config, PathSafety, PresetPool, SSH}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
 
@@ -13,6 +13,18 @@ defmodule SymphonyElixir.Workspace do
   @spec create_for_issue(map() | String.t() | nil, worker_host()) ::
           {:ok, Path.t()} | {:error, term()}
   def create_for_issue(issue_or_identifier, worker_host \\ nil) do
+    if PresetPool.enabled?() or PresetPool.assigned?(issue_or_identifier) do
+      if is_nil(worker_host) do
+        PresetPool.reserve(issue_or_identifier)
+      else
+        {:error, :preset_pool_requires_local_worker}
+      end
+    else
+      create_issue_workspace(issue_or_identifier, worker_host)
+    end
+  end
+
+  defp create_issue_workspace(issue_or_identifier, worker_host) do
     issue_context = issue_context(issue_or_identifier)
 
     try do
@@ -111,6 +123,14 @@ defmodule SymphonyElixir.Workspace do
   end
 
   def remove(workspace, worker_host) when is_binary(worker_host) do
+    if PresetPool.enabled?() or PresetPool.protected?(workspace) do
+      {:error, :preset_pool_requires_local_worker, workspace}
+    else
+      remove_remote_workspace(workspace, worker_host)
+    end
+  end
+
+  defp remove_remote_workspace(workspace, worker_host) do
     maybe_run_before_remove_hook(workspace, worker_host)
 
     script =
@@ -157,8 +177,12 @@ defmodule SymphonyElixir.Workspace do
   end
 
   defp remove_local_workspace(workspace) do
-    maybe_run_before_remove_hook(workspace, nil)
-    File.rm_rf(workspace)
+    if PresetPool.protected?(workspace) do
+      PresetPool.release(workspace)
+    else
+      maybe_run_before_remove_hook(workspace, nil)
+      File.rm_rf(workspace)
+    end
   end
 
   @spec remove_issue_workspaces(term()) :: :ok
@@ -176,18 +200,7 @@ defmodule SymphonyElixir.Workspace do
   end
 
   def remove_issue_workspaces(%{id: _issue_id, identifier: _identifier} = issue, nil) do
-    case Config.settings!().worker.ssh_hosts do
-      [] ->
-        case workspace_path_for_issue(workspace_key(issue), nil) do
-          {:ok, workspace} -> remove(workspace, nil)
-          {:error, _reason} -> :ok
-        end
-
-      worker_hosts ->
-        Enum.each(worker_hosts, &remove_issue_workspaces(issue, &1))
-    end
-
-    :ok
+    if PresetPool.assigned?(issue), do: PresetPool.release_issue(issue), else: remove_unassigned_issue_workspaces(issue)
   end
 
   def remove_issue_workspaces(identifier, worker_host) when is_binary(identifier) and is_binary(worker_host) do
@@ -216,9 +229,32 @@ defmodule SymphonyElixir.Workspace do
 
   def remove_issue_workspaces(_identifier, _worker_host), do: :ok
 
+  defp remove_unassigned_issue_workspaces(issue) do
+    case Config.settings!().worker.ssh_hosts do
+      [] ->
+        case workspace_path_for_issue(workspace_key(issue), nil) do
+          {:ok, workspace} -> remove(workspace, nil)
+          {:error, _reason} -> :ok
+        end
+
+      worker_hosts ->
+        Enum.each(worker_hosts, &remove_issue_workspaces(issue, &1))
+    end
+
+    :ok
+  end
+
   @spec run_before_run_hook(Path.t(), map() | String.t() | nil, worker_host()) ::
           :ok | {:error, term()}
   def run_before_run_hook(workspace, issue_or_identifier, worker_host \\ nil) when is_binary(workspace) do
+    if PresetPool.protected?(workspace) do
+      PresetPool.prepare(workspace, issue_or_identifier)
+    else
+      run_regular_before_run_hook(workspace, issue_or_identifier, worker_host)
+    end
+  end
+
+  defp run_regular_before_run_hook(workspace, issue_or_identifier, worker_host) do
     issue_context = issue_context(issue_or_identifier)
     hooks = Config.settings!().hooks
 
@@ -233,6 +269,14 @@ defmodule SymphonyElixir.Workspace do
 
   @spec run_after_run_hook(Path.t(), map() | String.t() | nil, worker_host()) :: :ok
   def run_after_run_hook(workspace, issue_or_identifier, worker_host \\ nil) when is_binary(workspace) do
+    if PresetPool.protected?(workspace) do
+      :ok
+    else
+      run_regular_after_run_hook(workspace, issue_or_identifier, worker_host)
+    end
+  end
+
+  defp run_regular_after_run_hook(workspace, issue_or_identifier, worker_host) do
     issue_context = issue_context(issue_or_identifier)
     hooks = Config.settings!().hooks
 

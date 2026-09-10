@@ -17,6 +17,12 @@ tracker:
     - Done
 polling:
   interval_ms: 5000
+# Optional local preset mode (replace this workspace block; see README):
+# workspace:
+#   mode: preset
+#   root: ~/Workspaces
+#   environments: [apa-02]
+# Preset mode uses dev/job.sh and bypasses the ordinary lifecycle hooks.
 workspace:
   root: ~/code/symphony-workspaces
 hooks:
