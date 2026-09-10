@@ -123,6 +123,16 @@ defmodule SymphonyElixir.LinearRateLimitTest do
     assert :ok = RateLimit.check()
   end
 
+  test "rate-limit pause without a usable duration falls back to the default pause" do
+    assert RateLimit.pause(nil) == RateLimit.default_pause_ms()
+    assert {:rate_limited, _remaining} = RateLimit.check()
+
+    RateLimit.clear()
+
+    assert RateLimit.pause(-1) == RateLimit.default_pause_ms()
+    assert {:rate_limited, _remaining} = RateLimit.check()
+  end
+
   test "RATELIMITED 400 response trips the global breaker and short-circuits later requests" do
     parent = self()
 
@@ -223,6 +233,24 @@ defmodule SymphonyElixir.LinearRateLimitTest do
 
     assert {:rate_limited, {:linear_rate_limited, 123}} =
              AgentRunner.continue_with_issue_for_test?(issue, fetcher)
+  end
+
+  test "continuation check keeps the live session only while the active state is unchanged" do
+    issue = LinearClientStub.issue()
+
+    same_state_fetcher = fn _ids ->
+      {:ok, [%{issue | state: " in progress "}]}
+    end
+
+    changed_state_fetcher = fn _ids ->
+      {:ok, [%{issue | state: "Todo"}]}
+    end
+
+    assert {:continue, %{state: " in progress "}} =
+             AgentRunner.continue_with_issue_for_test?(issue, same_state_fetcher)
+
+    assert {:state_changed, %{state: "Todo"}} =
+             AgentRunner.continue_with_issue_for_test?(issue, changed_state_fetcher)
   end
 
   test "rate limited dispatch-time refresh keeps the retry chain alive and dispatch resumes" do

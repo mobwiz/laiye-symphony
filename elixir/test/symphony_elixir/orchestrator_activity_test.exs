@@ -1,0 +1,454 @@
+defmodule SymphonyElixir.OrchestratorActivityTest do
+  use SymphonyElixir.TestSupport
+
+  alias SymphonyElixir.Codex.Activity
+
+  # The candidate read is deliberately empty: before parked states were read at
+  # all, that meant an empty board, and a self parked issue vanished from it.
+  # The memory tracker cannot show this -- it returns every issue for every
+  # read, so the two lists would be indistinguishable.
+  defmodule TwoListClient do
+    def fetch_issues_by_states(["Gated"]) do
+      {:ok,
+       [
+         %Issue{
+           id: "issue-gated",
+           identifier: "MT-GATED",
+           title: "Self parked",
+           state: "Gated",
+           labels: ["gate:decision"],
+           dispatchable: true,
+           assigned_to_worker: true
+         },
+         %Issue{
+           id: "issue-theirs",
+           identifier: "MT-THEIRS",
+           title: "Someone else's",
+           state: "Gated",
+           assigned_to_worker: false
+         }
+       ]}
+    end
+
+    def fetch_issues_by_states(_states), do: {:ok, []}
+    def fetch_issues_by_ids(_ids), do: {:ok, []}
+  end
+
+  defp start_orchestrator(name) do
+    orchestrator_name = Module.concat(__MODULE__, name)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    pid
+  end
+
+  defp inject_running(pid, issue_id, started_at, overrides \\ %{}) do
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-ACT",
+      title: "Activity test",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-ACT"
+    }
+
+    entry =
+      Map.merge(
+        %{
+          pid: self(),
+          ref: make_ref(),
+          identifier: issue.identifier,
+          issue: issue,
+          worker_host: nil,
+          workspace_path: nil,
+          session_id: "thread-act",
+          last_codex_message: nil,
+          last_codex_timestamp: nil,
+          last_codex_event: nil,
+          codex_app_server_pid: nil,
+          codex_input_tokens: 0,
+          codex_output_tokens: 0,
+          codex_total_tokens: 0,
+          codex_last_reported_input_tokens: 0,
+          codex_last_reported_output_tokens: 0,
+          codex_last_reported_total_tokens: 0,
+          turn_count: 0,
+          retry_attempt: nil,
+          started_at: started_at,
+          activity: Activity.initial(started_at),
+          last_progress_at: started_at,
+          activity_trail: [],
+          plan: nil,
+          diff_stats: nil,
+          stdout_tail: ""
+        },
+        overrides
+      )
+
+    :sys.replace_state(pid, fn state ->
+      state
+      |> Map.put(:running, %{issue_id => entry})
+      |> Map.put(:claimed, MapSet.put(state.claimed, issue_id))
+    end)
+
+    entry
+  end
+
+  defp notification(method, params, timestamp) do
+    %{event: :notification, timestamp: timestamp, payload: %{"method" => method, "params" => params}}
+  end
+
+  defp running_entry(pid) do
+    %{running: [entry]} = GenServer.call(pid, :snapshot)
+    entry
+  end
+
+  test "streaming noise refreshes the heartbeat without changing the reported activity" do
+    pid = start_orchestrator(:Heartbeat)
+    started_at = ~U[2026-07-31 08:00:00Z]
+    inject_running(pid, "issue-heartbeat", started_at)
+
+    send(
+      pid,
+      {:codex_worker_update, "issue-heartbeat",
+       notification(
+         "item/started",
+         %{"item" => %{"id" => "exec-1", "type" => "commandExecution", "command" => "mix test"}},
+         ~U[2026-07-31 08:01:00Z]
+       )}
+    )
+
+    send(
+      pid,
+      {:codex_worker_update, "issue-heartbeat", notification("item/reasoning/textDelta", %{"delta" => "still thinking"}, ~U[2026-07-31 08:03:30Z])}
+    )
+
+    entry = running_entry(pid)
+
+    assert entry.activity.kind == :command
+    assert entry.activity.detail == "mix test"
+    # The activity still dates from when the command started...
+    assert entry.activity.since == ~U[2026-07-31 08:01:00Z]
+    # ...while the delta, which carries no meaning of its own, proves liveness.
+    assert entry.last_progress_at == ~U[2026-07-31 08:03:30Z]
+  end
+
+  test "the trail records semantic events only and stays bounded" do
+    pid = start_orchestrator(:Trail)
+    started_at = ~U[2026-07-31 08:00:00Z]
+    inject_running(pid, "issue-trail", started_at)
+
+    Enum.each(1..60, fn index ->
+      send(
+        pid,
+        {:codex_worker_update, "issue-trail",
+         notification(
+           "item/completed",
+           %{"item" => %{"id" => "exec-#{index}", "type" => "commandExecution", "command" => "step #{index}"}},
+           started_at
+         )}
+      )
+
+      send(
+        pid,
+        {:codex_worker_update, "issue-trail", notification("item/reasoning/textDelta", %{"delta" => "noise #{index}"}, started_at)}
+      )
+    end)
+
+    entry = running_entry(pid)
+
+    assert length(entry.activity_trail) == 50
+    assert Enum.all?(entry.activity_trail, &(&1.title =~ ~r/^step \d+$/))
+    assert List.first(entry.activity_trail).title == "step 60"
+  end
+
+  test "messages and prompts outlive a flood of tool steps" do
+    pid = start_orchestrator(:TrailClasses)
+    started_at = ~U[2026-07-31 08:00:00Z]
+    inject_running(pid, "issue-classes", started_at)
+
+    send(
+      pid,
+      {:codex_worker_update, "issue-classes",
+       notification(
+         "item/completed",
+         %{"item" => %{"id" => "msg-1", "type" => "agentMessage", "text" => "found the root cause"}},
+         started_at
+       )}
+    )
+
+    send(
+      pid,
+      {:turn_prompt_archived, "issue-classes",
+       %{
+         identifier: "MT-ACT",
+         basename: "20260731T080000Z-turn1.json",
+         path: "/tmp/prompts/MT-ACT/20260731T080000Z-turn1.json",
+         turn: 1,
+         chars: 100,
+         at: started_at
+       }}
+    )
+
+    Enum.each(1..80, fn index ->
+      send(
+        pid,
+        {:codex_worker_update, "issue-classes",
+         notification(
+           "item/completed",
+           %{"item" => %{"id" => "exec-#{index}", "type" => "commandExecution", "command" => "step #{index}"}},
+           started_at
+         )}
+      )
+    end)
+
+    entry = running_entry(pid)
+    kinds = Enum.frequencies_by(entry.activity_trail, & &1.kind)
+
+    # Under one shared cap, 80 commands would have pushed both off the end.
+    # Each class holds its own budget, so the narrative survives at the tail
+    # while the command window stays bounded.
+    assert kinds[:command] == 50
+    assert kinds[:writing] == 1
+    assert kinds[:prompt] == 1
+    assert List.last(entry.activity_trail).title == "found the root cause"
+  end
+
+  test "an archived turn prompt lands on the trail as a reference, not as text" do
+    pid = start_orchestrator(:PromptTrail)
+    started_at = ~U[2026-07-31 08:00:00Z]
+    inject_running(pid, "issue-prompt", started_at)
+
+    send(
+      pid,
+      {:turn_prompt_archived, "issue-prompt",
+       %{
+         identifier: "MT-ACT",
+         basename: "20260731T080000Z-turn1.json",
+         path: "/tmp/prompts/MT-ACT/20260731T080000Z-turn1.json",
+         turn: 1,
+         chars: 41_093,
+         at: started_at
+       }}
+    )
+
+    entry = running_entry(pid)
+    [trail | _rest] = entry.activity_trail
+
+    assert trail.kind == :prompt
+    assert trail.title == "Turn 1 prompt injected"
+    assert trail.prompt.basename == "20260731T080000Z-turn1.json"
+    assert trail.prompt.chars == 41_093
+    refute Map.has_key?(trail.prompt, :prompt)
+    # The activity itself is untouched: archiving is bookkeeping, not progress.
+    assert entry.activity == Activity.initial(started_at)
+  end
+
+  test "captured command output is bounded and stays valid utf-8" do
+    pid = start_orchestrator(:Stdout)
+    started_at = ~U[2026-07-31 08:00:00Z]
+    inject_running(pid, "issue-stdout", started_at)
+
+    chunk = String.duplicate("中", 400)
+
+    Enum.each(1..3, fn _index ->
+      send(
+        pid,
+        {:codex_worker_update, "issue-stdout", notification("item/commandExecution/outputDelta", %{"outputDelta" => chunk}, started_at)}
+      )
+    end)
+
+    entry = running_entry(pid)
+
+    assert byte_size(entry.stdout_tail) <= 2_048
+    assert String.valid?(entry.stdout_tail)
+    assert String.ends_with?(entry.stdout_tail, "中")
+  end
+
+  test "issues with no session are retained with the state they are parked in" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", tracker_parked_states: ["Agent Review", "Merging"])
+
+    parked = %Issue{
+      id: "issue-parked",
+      dispatchable: true,
+      identifier: "MT-PARKED",
+      title: "Waiting on CI",
+      # Not an active state, so the orchestrator will never dispatch it -- the
+      # exact case that used to be invisible on the dashboard.
+      state: "Agent Review",
+      labels: ["gate:ci"],
+      url: "https://example.org/issues/MT-PARKED"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [parked])
+    on_exit(fn -> Application.put_env(:symphony_elixir, :memory_tracker_issues, []) end)
+
+    pid = start_orchestrator(:Observed)
+
+    send(pid, :run_poll_cycle)
+    %{observed: [first]} = GenServer.call(pid, :snapshot)
+
+    assert first.identifier == "MT-PARKED"
+    assert first.state == "Agent Review"
+    assert first.labels == ["gate:ci"]
+    # First sighting: the orchestrator never saw the transition, so the dwell
+    # time is only a lower bound and must say so.
+    refute first.state_since_exact?
+
+    send(pid, :run_poll_cycle)
+    %{observed: [second]} = GenServer.call(pid, :snapshot)
+
+    assert second.state_since == first.state_since
+    refute second.state_since_exact?
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [%{parked | state: "Merging"}])
+    send(pid, :run_poll_cycle)
+    %{observed: [moved]} = GenServer.call(pid, :snapshot)
+
+    assert moved.state == "Merging"
+    assert moved.state_since_exact?
+  end
+
+  test "an issue never appears as both running and awaiting dispatch" do
+    pid = start_orchestrator(:NoDoubleCount)
+    started_at = DateTime.utc_now()
+    inject_running(pid, "issue-both", started_at)
+
+    # Dispatch happens later in the same poll cycle that records observed
+    # issues, so the two views overlap for a moment unless the snapshot filters.
+    :sys.replace_state(pid, fn state ->
+      Map.put(state, :observed, %{
+        "issue-both" => %{
+          issue_id: "issue-both",
+          identifier: "MT-ACT",
+          title: "Both",
+          state: "In Progress",
+          url: nil,
+          labels: [],
+          state_since: started_at,
+          state_since_exact?: true,
+          active_state?: true,
+          last_seen_at: started_at
+        }
+      })
+    end)
+
+    %{running: [running], observed: observed} = GenServer.call(pid, :snapshot)
+
+    assert running.identifier == "MT-ACT"
+    assert observed == []
+  end
+
+  test "issues routed to another worker are never observed at all" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory", tracker_parked_states: ["Agent Review", "Merging"])
+
+    mine = %Issue{
+      id: "issue-mine",
+      dispatchable: true,
+      identifier: "MT-MINE",
+      title: "Mine",
+      state: "Agent Review",
+      url: "https://example.org/issues/MT-MINE"
+    }
+
+    theirs = %Issue{
+      id: "issue-theirs",
+      identifier: "MT-THEIRS",
+      title: "Someone else's",
+      state: "Agent Review",
+      assigned_to_worker: false,
+      url: "https://example.org/issues/MT-THEIRS"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [mine, theirs])
+    on_exit(fn -> Application.put_env(:symphony_elixir, :memory_tracker_issues, []) end)
+
+    pid = start_orchestrator(:Routing)
+    send(pid, :run_poll_cycle)
+
+    %{observed: observed} = GenServer.call(pid, :snapshot)
+
+    assert Enum.map(observed, & &1.identifier) == ["MT-MINE"]
+  end
+
+  test "blocked issues are not duplicated in the observed lane" do
+    pid = start_orchestrator(:BlockedObservation)
+
+    :sys.replace_state(pid, fn state ->
+      blocked = %{"blocked" => %{identifier: "MT-BLOCKED"}}
+      observed = %{"blocked" => %{issue_id: "blocked", state_since: DateTime.utc_now()}}
+      %{state | blocked: blocked, observed: observed}
+    end)
+
+    assert %{observed: [], blocked: [%{identifier: "MT-BLOCKED"}]} = GenServer.call(pid, :snapshot)
+  end
+
+  test "a finished session stays available after it leaves the running set" do
+    pid = start_orchestrator(:Recent)
+    started_at = DateTime.add(DateTime.utc_now(), -30, :second)
+    entry = inject_running(pid, "issue-recent", started_at, %{codex_total_tokens: 4_242, turn_count: 3})
+
+    send(
+      pid,
+      {:codex_worker_update, "issue-recent",
+       notification(
+         "item/completed",
+         %{"item" => %{"id" => "exec-1", "type" => "commandExecution", "command" => "git push"}},
+         DateTime.utc_now()
+       )}
+    )
+
+    _flush = GenServer.call(pid, :snapshot)
+    send(pid, {:DOWN, entry.ref, :process, self(), :normal})
+
+    %{running: running, recent: [recent]} = GenServer.call(pid, :snapshot)
+
+    assert running == []
+    assert recent.issue_id == "issue-recent"
+    assert recent.outcome == :completed
+    assert recent.turn_count == 3
+    assert recent.tokens.total_tokens == 4_242
+    assert recent.runtime_seconds >= 30
+    assert Enum.any?(recent.activity_trail, &(&1.title == "git push"))
+  end
+
+  test "self parked issues stay on the board without becoming dispatchable" do
+    previous_client = Application.get_env(:symphony_elixir, :linear_client_module)
+    Application.put_env(:symphony_elixir, :linear_client_module, TwoListClient)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "linear",
+      tracker_active_states: ["Todo"],
+      tracker_parked_states: ["Gated"]
+    )
+
+    on_exit(fn ->
+      if is_nil(previous_client) do
+        Application.delete_env(:symphony_elixir, :linear_client_module)
+      else
+        Application.put_env(:symphony_elixir, :linear_client_module, previous_client)
+      end
+
+      write_workflow_file!(Workflow.workflow_file_path())
+    end)
+
+    pid = start_orchestrator(:Parked)
+    send(pid, :run_poll_cycle)
+
+    %{observed: observed, running: running} = GenServer.call(pid, :snapshot)
+    by_identifier = Map.new(observed, &{&1.identifier, &1})
+
+    # The whole point: an issue that left the active states is still on the
+    # board, carrying the state and the gate label that say who has to act.
+    assert %{state: "Gated", labels: ["gate:decision"], active_state?: false} =
+             by_identifier["MT-GATED"]
+
+    # Watched, never queued. Nothing here is dispatchable.
+    assert running == []
+    # And the parked read is routed like any other: someone else's parked issue
+    # is not this worker's board.
+    refute Map.has_key?(by_identifier, "MT-THEIRS")
+  end
+end

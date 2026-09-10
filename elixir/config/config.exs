@@ -19,3 +19,10 @@ if config_env() == :test do
   config :symphony_elixir,
     workflow_file_path: Path.expand("../test/fixtures/startup_workflow.md", __DIR__)
 end
+
+config :tailwind,
+  version: "4.1.14",
+  default: [
+    args: ~w(--input=assets/css/app.css --output=priv/static/dashboard.css),
+    cd: Path.expand("..", __DIR__)
+  ]

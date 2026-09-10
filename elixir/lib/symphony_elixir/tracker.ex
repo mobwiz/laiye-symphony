@@ -31,6 +31,11 @@ defmodule SymphonyElixir.Tracker do
                       execute_agent_tool: 3,
                       validate_config: 1
 
+  @spec fetch_parked_issues() :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_parked_issues do
+    fetch_issues_by_states(Config.settings!().tracker.parked_states)
+  end
+
   @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_states(states) do
     adapter().fetch_issues_by_states(states)

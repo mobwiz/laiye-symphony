@@ -100,6 +100,7 @@ defmodule SymphonyElixir.TestSupport do
           tracker_required_labels: [],
           tracker_active_labels: [],
           tracker_active_states: ["Todo", "In Progress"],
+          tracker_parked_states: [],
           tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
           poll_interval_ms: 30_000,
           workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
@@ -109,6 +110,7 @@ defmodule SymphonyElixir.TestSupport do
           max_turns: 20,
           max_retry_backoff_ms: 300_000,
           continuation_min_turn_interval_ms: nil,
+          non_active_drain_timeout_ms: nil,
           max_concurrent_agents_by_state: %{},
           codex_command: "codex app-server",
           codex_approval_policy: %{reject: %{sandbox_approval: true, rules: true, mcp_elicitations: true}},
@@ -117,6 +119,10 @@ defmodule SymphonyElixir.TestSupport do
           codex_turn_timeout_ms: 3_600_000,
           codex_read_timeout_ms: 5_000,
           codex_stall_timeout_ms: 300_000,
+          prompt_context_command: nil,
+          prompt_context_required: false,
+          prompt_context_timeout_ms: 30_000,
+          prompt_context_max_chars: 16_384,
           hook_after_create: nil,
           hook_before_run: nil,
           hook_after_run: nil,
@@ -141,6 +147,7 @@ defmodule SymphonyElixir.TestSupport do
     tracker_required_labels = Keyword.get(config, :tracker_required_labels)
     tracker_active_labels = Keyword.get(config, :tracker_active_labels)
     tracker_active_states = Keyword.get(config, :tracker_active_states)
+    tracker_parked_states = Keyword.get(config, :tracker_parked_states)
     tracker_terminal_states = Keyword.get(config, :tracker_terminal_states)
     poll_interval_ms = Keyword.get(config, :poll_interval_ms)
     workspace_root = Keyword.get(config, :workspace_root)
@@ -150,6 +157,7 @@ defmodule SymphonyElixir.TestSupport do
     max_turns = Keyword.get(config, :max_turns)
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
     continuation_min_turn_interval_ms = Keyword.get(config, :continuation_min_turn_interval_ms)
+    non_active_drain_timeout_ms = Keyword.get(config, :non_active_drain_timeout_ms)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
     codex_command = Keyword.get(config, :codex_command)
     codex_approval_policy = Keyword.get(config, :codex_approval_policy)
@@ -158,6 +166,10 @@ defmodule SymphonyElixir.TestSupport do
     codex_turn_timeout_ms = Keyword.get(config, :codex_turn_timeout_ms)
     codex_read_timeout_ms = Keyword.get(config, :codex_read_timeout_ms)
     codex_stall_timeout_ms = Keyword.get(config, :codex_stall_timeout_ms)
+    prompt_context_command = Keyword.get(config, :prompt_context_command)
+    prompt_context_required = Keyword.get(config, :prompt_context_required)
+    prompt_context_timeout_ms = Keyword.get(config, :prompt_context_timeout_ms)
+    prompt_context_max_chars = Keyword.get(config, :prompt_context_max_chars)
     hook_after_create = Keyword.get(config, :hook_after_create)
     hook_before_run = Keyword.get(config, :hook_before_run)
     hook_after_run = Keyword.get(config, :hook_after_run)
@@ -183,6 +195,7 @@ defmodule SymphonyElixir.TestSupport do
         "  required_labels: #{yaml_value(tracker_required_labels)}",
         "  active_labels: #{yaml_value(tracker_active_labels)}",
         "  active_states: #{yaml_value(tracker_active_states)}",
+        "  parked_states: #{yaml_value(tracker_parked_states)}",
         "  terminal_states: #{yaml_value(tracker_terminal_states)}",
         "polling:",
         "  interval_ms: #{yaml_value(poll_interval_ms)}",
@@ -194,6 +207,7 @@ defmodule SymphonyElixir.TestSupport do
         "  max_turns: #{yaml_value(max_turns)}",
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
         "  continuation_min_turn_interval_ms: #{yaml_value(continuation_min_turn_interval_ms)}",
+        "  non_active_drain_timeout_ms: #{yaml_value(non_active_drain_timeout_ms)}",
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
         "codex:",
         "  command: #{yaml_value(codex_command)}",
@@ -203,6 +217,12 @@ defmodule SymphonyElixir.TestSupport do
         "  turn_timeout_ms: #{yaml_value(codex_turn_timeout_ms)}",
         "  read_timeout_ms: #{yaml_value(codex_read_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
+        prompt_context_yaml(
+          prompt_context_command,
+          prompt_context_required,
+          prompt_context_timeout_ms,
+          prompt_context_max_chars
+        ),
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
         server_yaml(server_port, server_host),
@@ -235,6 +255,20 @@ defmodule SymphonyElixir.TestSupport do
   end
 
   defp yaml_value(value), do: yaml_value(to_string(value))
+
+  defp prompt_context_yaml(nil, false, 30_000, 16_384), do: nil
+
+  defp prompt_context_yaml(command, required, timeout_ms, max_chars) do
+    [
+      "prompt_context:",
+      command && "  command: #{yaml_value(command)}",
+      "  required: #{yaml_value(required)}",
+      "  timeout_ms: #{yaml_value(timeout_ms)}",
+      "  max_chars: #{yaml_value(max_chars)}"
+    ]
+    |> Enum.reject(&(&1 in [nil, false]))
+    |> Enum.join("\n")
+  end
 
   defp hooks_yaml(nil, nil, nil, nil, timeout_ms), do: "hooks:\n  timeout_ms: #{yaml_value(timeout_ms)}"
 

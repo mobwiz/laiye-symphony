@@ -60,6 +60,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:active_labels, {:array, :string}, default: [])
       field(:active_states, {:array, :string})
       field(:terminal_states, {:array, :string})
+      field(:parked_states, {:array, :string}, default: [])
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -78,6 +79,7 @@ defmodule SymphonyElixir.Config.Schema do
           :required_labels,
           :active_labels,
           :active_states,
+          :parked_states,
           :terminal_states
         ],
         empty_values: []
@@ -168,6 +170,11 @@ defmodule SymphonyElixir.Config.Schema do
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
       field(:continuation_min_turn_interval_ms, :integer, default: 0)
+      # How long a running agent may keep finishing its current turn after its
+      # issue leaves the active states -- workers park their own issues
+      # mid-turn, so an immediate stop races the worker's own shutdown.
+      # 0 disables draining and stops the agent immediately.
+      field(:non_active_drain_timeout_ms, :integer, default: 180_000)
       field(:max_concurrent_agents_by_state, :map, default: %{})
     end
 
@@ -181,6 +188,7 @@ defmodule SymphonyElixir.Config.Schema do
           :max_turns,
           :max_retry_backoff_ms,
           :continuation_min_turn_interval_ms,
+          :non_active_drain_timeout_ms,
           :max_concurrent_agents_by_state
         ],
         empty_values: []
@@ -189,6 +197,7 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:max_turns, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
       |> validate_number(:continuation_min_turn_interval_ms, greater_than_or_equal_to: 0)
+      |> validate_number(:non_active_drain_timeout_ms, greater_than_or_equal_to: 0)
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
     end
@@ -272,6 +281,39 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule PromptContext do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:command, :string)
+      field(:required, :boolean, default: false)
+      field(:timeout_ms, :integer, default: 30_000)
+      field(:max_chars, :integer, default: 16_384)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:command, :required, :timeout_ms, :max_chars], empty_values: [])
+      |> validate_number(:timeout_ms, greater_than: 0)
+      |> validate_number(:max_chars, greater_than: 0)
+      |> validate_command_when_required()
+    end
+
+    defp validate_command_when_required(changeset) do
+      if get_field(changeset, :required) and blank?(get_field(changeset, :command)) do
+        add_error(changeset, :command, "is required when prompt_context.required is true")
+      else
+        changeset
+      end
+    end
+
+    defp blank?(value), do: not is_binary(value) or String.trim(value) == ""
+  end
+
   defmodule Observability do
     @moduledoc false
     use Ecto.Schema
@@ -319,6 +361,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:worker, Worker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:prompt_context, PromptContext, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
@@ -413,6 +456,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:worker, with: &Worker.changeset/2)
     |> cast_embed(:agent, with: &Agent.changeset/2)
     |> cast_embed(:codex, with: &Codex.changeset/2)
+    |> cast_embed(:prompt_context, with: &PromptContext.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)

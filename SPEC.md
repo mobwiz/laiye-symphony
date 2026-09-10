@@ -346,6 +346,9 @@ Parsing rules:
 - If front matter is absent, treat the entire file as prompt body and use an empty config map.
 - YAML front matter MUST decode to a map/object; non-map YAML is an error.
 - Prompt body is trimmed before use.
+- `WORKFLOW.md` is read as UTF-8. Lines are split on `\n`, `\r\n`, or `\r` only, and splitting MUST
+  NOT treat a byte inside a multi-byte UTF-8 character as a line break. A prompt body that is valid
+  UTF-8 on disk MUST stay valid UTF-8 after parsing.
 
 Returned workflow object:
 
@@ -455,6 +458,13 @@ Fields:
 - `max_retry_backoff_ms` (integer)
   - Default: `300000` (5 minutes)
   - Changes SHOULD be re-applied at runtime and affect future retry scheduling.
+- `non_active_drain_timeout_ms` (integer)
+  - Default: `180000` (3 minutes)
+  - How long a running worker may keep finishing its current turn after its issue moves to a
+    non-active (non-terminal) state before it is force-stopped. Workers park their own issues as the
+    last action of a turn, so an immediate stop would race the worker's own shutdown and lose the
+    run's completion accounting.
+  - If `<= 0`, draining is disabled and the worker is stopped immediately.
 - `max_concurrent_agents_by_state` (map `state_name -> positive integer`)
   - Default: empty map.
   - State keys are normalized (`trim + lowercase`) for lookup.
@@ -623,6 +633,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.max_concurrent_agents`: integer, default `10`
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
+- `agent.non_active_drain_timeout_ms`: integer, default `180000` (3m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
 - `codex.command`: shell command string, default `codex app-server`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
@@ -631,6 +642,10 @@ not require recognizing or validating extension fields unless that extension is 
 - `codex.turn_timeout_ms`: integer, default `3600000`
 - `codex.read_timeout_ms`: integer, default `5000`
 - `codex.stall_timeout_ms`: integer, default `300000`
+- `prompt_context.command`: optional shell command string, default unset
+- `prompt_context.required`: boolean, default `false`
+- `prompt_context.timeout_ms`: positive integer, default `30000`
+- `prompt_context.max_chars`: positive integer, default `16384`
 
 ## 7. Orchestration State Machine
 
@@ -664,8 +679,16 @@ Important nuance:
 - A successful worker exit does not mean the issue is done forever.
 - The worker MAY continue through multiple back-to-back coding-agent turns before it exits.
 - After each normal turn completion, the worker re-checks the tracker issue state.
-- If the issue is still in an active state, the worker SHOULD start another turn on the same live
-  coding-agent thread in the same workspace, up to `agent.max_turns`.
+- If the issue is still in the same active tracker state, the worker SHOULD start another turn on
+  the same live coding-agent thread in the same workspace, up to `agent.max_turns`.
+- If the issue changes from one active tracker state to another, the worker SHOULD end the current
+  session normally. The orchestrator's continuation retry redispatches the still-active issue with
+  a fresh coding-agent session, so workflow roles such as build, review, and rework do not inherit
+  one another's live thread history.
+- If a completed turn leaves a valid `.symphony/fresh-thread-handoff.json` receipt bound to the
+  issue and the current prompt-context contract hash, the worker SHOULD consume it and end the
+  current session normally. The ordinary continuation retry then redispatches the unchanged active
+  issue with a fresh coding-agent session.
 - The first turn SHOULD use the full rendered task prompt.
 - Continuation turns SHOULD send only continuation guidance to the existing thread, not resend the
   original task prompt that is already present in thread history.
@@ -833,9 +856,16 @@ Part B: Tracker state refresh
 - Fetch current issue states for all running issue IDs.
 - For each running issue:
   - If tracker state is terminal: terminate worker and clean workspace.
-  - If tracker state is still active and routable: update the in-memory issue snapshot.
+  - If tracker state is still active and routable: update the in-memory issue snapshot and clear any pending
+    drain deadline.
+  - If tracker state is neither active nor terminal: mark the worker as draining and let the
+    current turn finish. Workers re-check the tracker state after each turn and exit normally when
+    the issue is no longer active, so a self-parked issue completes with full session accounting
+    (completion event, `after_run` hook, token totals). If the worker is still running once
+    `agent.non_active_drain_timeout_ms` elapses, terminate it without workspace cleanup and record
+    the session as failed with reason `drain_timeout`. If the timeout is `<= 0`, terminate
+    immediately (pre-drain behavior).
   - If tracker state is active but no longer routable: terminate worker without workspace cleanup.
-  - If tracker state is neither active nor terminal: terminate worker without workspace cleanup.
 - If state refresh fails, keep workers running and try again on the next tick.
 
 ### 8.6 Startup Terminal Workspace Cleanup
@@ -962,6 +992,9 @@ Protocol source of truth:
   protocol controls protocol shape and transport behavior.
 - Symphony-specific requirements in this section still control orchestration behavior, workspace
   selection, prompt construction, continuation handling, and observability extraction.
+- Serializing an outbound message MUST NOT abort the turn on invalid UTF-8. Implementations MUST
+  repair the offending text, log the field, byte size, and first invalid byte offset, and send the
+  repaired message, so one damaged character cannot burn the turn and every retry behind it.
 
 ### 10.1 Launch Contract
 
@@ -1329,6 +1362,7 @@ Inputs to prompt rendering:
 - `workflow.prompt_template`
 - normalized `issue` object
 - OPTIONAL `attempt` integer (retry/continuation metadata)
+- OPTIONAL output from `prompt_context.command`, evaluated immediately before each turn
 
 ### 12.2 Rendering Rules
 
@@ -1336,6 +1370,16 @@ Inputs to prompt rendering:
 - Render with strict filter checking.
 - Convert issue object keys to strings for template compatibility.
 - Preserve nested arrays/maps (labels, blockers) so templates can iterate.
+- When `prompt_context.command` is configured, run it inside the issue workspace with
+  `SYMPHONY_ISSUE_IDENTIFIER`, `SYMPHONY_ISSUE_STATE`, and `SYMPHONY_CONTEXT_PHASE` in the
+  environment. Map the standard active states to `todo`, `build`, `rework`, and `review`.
+- Bound provider execution by `prompt_context.timeout_ms` and successful output by
+  `prompt_context.max_chars`. Successful output MUST contain a 64-hex contract-hash receipt and is
+  appended under a distinct `## Phase Context` section.
+- A required provider error MUST fail the attempt before the turn starts. An optional provider error
+  SHOULD be logged and MAY fall back to the static prompt alone.
+- Prompt archives SHOULD attribute tracker text, workflow template, and phase context separately and
+  persist the phase and compact contract-hash receipt.
 
 ### 12.3 Retry/Continuation Semantics
 
@@ -1954,6 +1998,14 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
       run_hook_best_effort("after_run", workspace.path)
       fail_worker("prompt error")
 
+    phase_context = run_prompt_context_provider(workspace.path, issue)
+    if required phase_context failed:
+      app_server.stop_session(session)
+      run_hook_best_effort("after_run", workspace.path)
+      fail_worker("prompt context error")
+
+    prompt = append_phase_context(prompt, phase_context)
+
     turn_result = app_server.run_turn(
       session=session,
       prompt=prompt,
@@ -1966,6 +2018,18 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
       run_hook_best_effort("after_run", workspace.path)
       fail_worker("agent turn error")
 
+    fresh_thread = consume_fresh_thread_receipt(
+      workspace.path,
+      issue.identifier,
+      phase_context.contract_hash
+    )
+    if fresh_thread is valid:
+      break
+    if fresh_thread is invalid:
+      app_server.stop_session(session)
+      run_hook_best_effort("after_run", workspace.path)
+      fail_worker("invalid fresh-thread receipt")
+
     refreshed_issue = tracker.fetch_issues_by_ids([issue.id])
     if refreshed_issue failed:
       app_server.stop_session(session)
@@ -1974,10 +2038,14 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
 
     if refreshed_issue is empty:
       break
+    previous_state = issue.state
 
     issue = refreshed_issue[0]
 
     if issue.state is not active or not issue_routable(issue):
+      break
+
+    if normalize(issue.state) != normalize(previous_state):
       break
 
     if turn_number >= max_turns:

@@ -492,7 +492,7 @@ defmodule SymphonyElixir.CoreTest do
     assert {:ok, []} = Client.fetch_issues_by_ids([])
   end
 
-  test "non-active issue state stops running agent without cleaning workspace" do
+  test "non-active issue state stops running agent immediately when draining is disabled" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -507,7 +507,8 @@ defmodule SymphonyElixir.CoreTest do
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: test_root,
         tracker_active_states: ["Todo", "In Progress", "In Review"],
-        tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"]
+        tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"],
+        non_active_drain_timeout_ms: 0
       )
 
       File.mkdir_p!(test_root)
@@ -553,6 +554,118 @@ defmodule SymphonyElixir.CoreTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  test "non-active issue state drains the running agent instead of stopping it mid-turn" do
+    issue_id = "issue-drain"
+    issue_identifier = "MT-559"
+
+    agent_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: agent_pid,
+          ref: nil,
+          identifier: issue_identifier,
+          issue: %Issue{id: issue_id, state: "In Progress", identifier: issue_identifier},
+          started_at: DateTime.utc_now()
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    parked_issue = %Issue{
+      id: issue_id,
+      identifier: issue_identifier,
+      state: "Backlog",
+      title: "Parked by its own worker",
+      description: "Turn is still wrapping up",
+      labels: []
+    }
+
+    drained_state = Orchestrator.reconcile_issue_states_for_test([parked_issue], state)
+    drained_entry = drained_state.running[issue_id]
+
+    assert Process.alive?(agent_pid)
+    assert MapSet.member?(drained_state.claimed, issue_id)
+    assert drained_entry.issue.state == "Backlog"
+    assert is_integer(drained_entry.drain_deadline_ms)
+
+    # A second sighting before the deadline keeps the agent draining.
+    redrained_state = Orchestrator.reconcile_issue_states_for_test([parked_issue], drained_state)
+
+    assert Process.alive?(agent_pid)
+    assert redrained_state.running[issue_id].drain_deadline_ms == drained_entry.drain_deadline_ms
+
+    # Returning to an active state cancels the drain entirely.
+    active_issue = %Issue{parked_issue | state: "In Progress", dispatchable: true}
+    resumed_state = Orchestrator.reconcile_issue_states_for_test([active_issue], redrained_state)
+    resumed_entry = resumed_state.running[issue_id]
+
+    assert Process.alive?(agent_pid)
+    assert resumed_entry.issue.state == "In Progress"
+    refute Map.has_key?(resumed_entry, :drain_deadline_ms)
+
+    send(agent_pid, :stop)
+  end
+
+  test "drain deadline expiry stops the agent and records the session" do
+    issue_id = "issue-drain-timeout"
+    issue_identifier = "MT-560"
+
+    agent_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    state = %Orchestrator.State{
+      running: %{
+        issue_id => %{
+          pid: agent_pid,
+          ref: nil,
+          identifier: issue_identifier,
+          issue: %Issue{id: issue_id, state: "In Progress", identifier: issue_identifier},
+          session_id: "session-drain-timeout",
+          started_at: DateTime.utc_now(),
+          drain_deadline_ms: System.monotonic_time(:millisecond) - 1
+        }
+      },
+      claimed: MapSet.new([issue_id]),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    parked_issue = %Issue{
+      id: issue_id,
+      identifier: issue_identifier,
+      state: "Backlog",
+      title: "Parked externally",
+      description: "Turn never finished",
+      labels: []
+    }
+
+    updated_state = Orchestrator.reconcile_issue_states_for_test([parked_issue], state)
+
+    refute Map.has_key?(updated_state.running, issue_id)
+    refute MapSet.member?(updated_state.claimed, issue_id)
+    refute Process.alive?(agent_pid)
+
+    assert [recent_entry] = updated_state.recent
+    assert recent_entry.issue_id == issue_id
+    assert recent_entry.identifier == issue_identifier
+    assert recent_entry.session_id == "session-drain-timeout"
+    assert recent_entry.outcome == :failed
+    assert recent_entry.reason == ":drain_timeout"
   end
 
   test "terminal issue state stops running agent before cleaning workspace" do
@@ -1154,6 +1267,7 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    down_sent_at_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :normal})
     Process.sleep(50)
     state = :sys.get_state(pid)
@@ -1162,7 +1276,7 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    assert_due_at_range(due_at_ms, down_sent_at_ms, 900, 1_100)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -1195,6 +1309,7 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    down_sent_at_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :boom})
     Process.sleep(50)
     state = :sys.get_state(pid)
@@ -1202,7 +1317,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    assert_due_at_range(due_at_ms, down_sent_at_ms, 39_900, 40_500)
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -1234,6 +1349,7 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    down_sent_at_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :boom})
     Process.sleep(50)
     state = :sys.get_state(pid)
@@ -1241,7 +1357,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 9_000, 10_500)
+    assert_due_at_range(due_at_ms, down_sent_at_ms, 9_900, 10_500)
   end
 
   test "stale retry timer messages do not consume newer retry entries" do
@@ -1361,11 +1477,11 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
   end
 
-  defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
-    remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
+  defp assert_due_at_range(due_at_ms, scheduled_after_ms, min_delay_ms, max_delay_ms) do
+    delay_ms = due_at_ms - scheduled_after_ms
 
-    assert remaining_ms >= min_remaining_ms
-    assert remaining_ms <= max_remaining_ms
+    assert delay_ms >= min_delay_ms
+    assert delay_ms <= max_delay_ms
   end
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
@@ -1652,6 +1768,16 @@ defmodule SymphonyElixir.CoreTest do
       template_repo = Path.join(test_root, "source")
       workspace_root = Path.join(test_root, "workspaces")
       codex_binary = Path.join(test_root, "fake-codex")
+      contract_hash = String.duplicate("e", 64)
+
+      receipt =
+        Jason.encode!(%{
+          "schemaVersion" => 1,
+          "issue" => "S-99",
+          "contractHash" => contract_hash,
+          "reason" => "context-reset",
+          "requestedAt" => "2026-08-20T01:02:03Z"
+        })
 
       File.mkdir_p!(template_repo)
       File.mkdir_p!(workspace_root)
@@ -1677,6 +1803,8 @@ defmodule SymphonyElixir.CoreTest do
             printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-1\"}}}'
             ;;
           4)
+            mkdir -p .symphony
+            printf '%s' '#{receipt}' > .symphony/fresh-thread-handoff.json
             printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-1\"}}}'
             printf '%s\\n' '{\"method\":\"turn/completed\"}'
             exit 0
@@ -1692,7 +1820,9 @@ defmodule SymphonyElixir.CoreTest do
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
         hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
-        codex_command: "#{codex_binary} app-server"
+        codex_command: "#{codex_binary} app-server",
+        prompt_context_command: "printf '# Task Context\\n\\n- Contract hash: `#{contract_hash}`\\n'",
+        prompt_context_required: true
       )
 
       issue = %Issue{
@@ -1720,6 +1850,7 @@ defmodule SymphonyElixir.CoreTest do
       workspace = Path.join(workspace_root, workspace_name)
       assert File.exists?(workspace)
       assert File.exists?(Path.join(workspace, "README.md"))
+      refute File.exists?(Path.join(workspace, ".symphony/fresh-thread-handoff.json"))
     after
       File.rm_rf(test_root)
     end
@@ -1940,11 +2071,15 @@ defmodule SymphonyElixir.CoreTest do
 
       on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
 
+      context_hash = String.duplicate("f", 64)
+
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
         hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
         codex_command: "#{codex_binary} app-server",
-        max_turns: 3
+        max_turns: 3,
+        prompt_context_command: "printf '# Task Context: %s\\n\\n- Phase: `%s`\\n- Contract hash: `#{context_hash}`\\n' \"$SYMPHONY_ISSUE_IDENTIFIER\" \"$SYMPHONY_CONTEXT_PHASE\"",
+        prompt_context_required: true
       )
 
       parent = self()
@@ -2006,9 +2141,13 @@ defmodule SymphonyElixir.CoreTest do
 
       assert length(turn_texts) == 2
       assert Enum.at(turn_texts, 0) =~ "You are an agent for this repository."
+      assert Enum.at(turn_texts, 0) =~ "## Phase Context"
+      assert Enum.at(turn_texts, 0) =~ "Phase: `build`"
       refute Enum.at(turn_texts, 1) =~ "You are an agent for this repository."
       assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
       assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
+      assert Enum.at(turn_texts, 1) =~ "## Phase Context"
+      assert Enum.at(turn_texts, 1) =~ "Phase: `build`"
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)

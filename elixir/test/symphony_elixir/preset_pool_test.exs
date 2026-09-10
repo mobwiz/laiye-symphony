@@ -182,6 +182,39 @@ defmodule SymphonyElixir.PresetPoolTest do
     assert {:error, _} = PresetPool.reserve(issue("1"))
   end
 
+  test "review drains a preset worker without releasing its environment", %{root: root, env: env} do
+    configure(root, ["apa-02"], tracker_kind: "memory", tracker_active_states: ["symphony/in-progress"], tracker_parked_states: ["symphony/human-review"])
+    owner = %Issue{id: "43", identifier: "GT-43", title: "Review handoff", state: "symphony/in-progress", dispatchable: true}
+    assert {:ok, ^env} = PresetPool.reserve(owner)
+    assert :ok = PresetPool.prepare(env, owner)
+
+    pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :kill) end)
+
+    state = %Orchestrator.State{
+      running: %{owner.id => %{pid: pid, ref: nil, identifier: owner.identifier, issue: owner, started_at: DateTime.utc_now(), workspace_path: env}},
+      claimed: MapSet.new([owner.id])
+    }
+
+    parked = %{owner | state: "symphony/human-review", dispatchable: false}
+    updated = Orchestrator.reconcile_issue_states_for_test([parked], state)
+    assert Process.alive?(pid)
+    assert is_integer(updated.running[owner.id].drain_deadline_ms)
+    assert PresetPool.assigned?(owner)
+    assert {:error, :preset_pool_full} = PresetPool.reserve(issue("other"))
+    ref = Process.monitor(pid)
+    send(pid, :stop)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
+    assert {:ok, []} = PresetPool.release(env)
+    assert File.exists?(Path.join(env, "keep"))
+  end
+
   defp issue(id), do: %{id: id, identifier: "GT-#{id}"}
 
   defp configure(root, names, options \\ []) do

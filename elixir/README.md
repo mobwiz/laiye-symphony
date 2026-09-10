@@ -133,6 +133,12 @@ agent:
   max_turns: 20
 codex:
   command: codex app-server
+prompt_context:
+  command: |
+    ./bin/task-context --issue "$SYMPHONY_ISSUE_IDENTIFIER" --phase "$SYMPHONY_CONTEXT_PHASE"
+  required: true
+  timeout_ms: 30000
+  max_chars: 16384
 ---
 
 You are working on an issue from the configured tracker {{ issue.identifier }}.
@@ -165,6 +171,18 @@ Notes:
   by the Codex turn sandbox.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
+- `prompt_context.command` optionally runs in the issue workspace immediately before every turn.
+  Symphony sets `SYMPHONY_ISSUE_IDENTIFIER`, `SYMPHONY_ISSUE_STATE`, and
+  `SYMPHONY_CONTEXT_PHASE` (`todo`, `build`, `rework`, or `review`), then appends successful output
+  under `## Phase Context`. The output must contain a Markdown receipt line of the form
+  ``- Contract hash: `<64 hexadecimal characters>` ``.
+- `prompt_context.required` defaults to `false`. A required provider failure, timeout, empty or
+  malformed output, or output beyond `max_chars` fails the worker attempt before the Codex turn starts;
+  optional provider failures are logged and the turn continues without phase context.
+- An agent can request a fresh thread without changing tracker state by writing
+  `.symphony/fresh-thread-handoff.json`. Symphony consumes it only after a successful turn and only
+  when its issue identifier and contract hash match that turn's phase-context receipt. Valid reasons
+  are `late-mechanism`, `convergence`, and `context-reset`.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
@@ -345,9 +363,25 @@ The observability UI now runs on a minimal Phoenix stack:
 - Phoenix dependency static assets for the LiveView client bootstrap
 - Tracker issue identifiers link to the tracker-provided URL when it uses `http` or `https`
 
+### Styling
+
+The stylesheet is authored in `assets/css/app.css` and built by Tailwind into
+`priv/static/dashboard.css`, which `SymphonyElixirWeb.StaticAssets` embeds into
+the escript at compile time. Two consequences:
+
+- `mix build` runs `mix assets.build` first; editing the source CSS without
+  rebuilding ships the previous stylesheet inside the binary.
+- The built file is committed, because compilation reads it. `mix setup`
+  installs the standalone Tailwind executable, so no Node toolchain is needed.
+
+The token layer (palette, semantic `--color-*` names, type scale) is shared with
+the desktop client so the two surfaces stay visually consistent; only the accent
+diverges.
+
 ## Project Layout
 
 - `lib/`: application code and Mix tasks
+- `assets/css/app.css`: dashboard stylesheet source, built by Tailwind
 - `test/`: ExUnit coverage for runtime behavior
 - `WORKFLOW.md`: in-repo workflow contract used by local runs
 - `../.codex/`: repository-local Codex skills and setup helpers
@@ -468,6 +502,12 @@ Allocation follows existing issue priority. When the pool is full, no agent is s
 remain eligible for the next poll. An assigned issue resumes its same environment even if its name
 has been removed from `environments`. Existing manual ownership in `.environment/job.json` prevents
 allocation. Only one Symphony instance may manage a pool; cross-instance leasing is not implemented.
+
+For Gitea review visibility, set `tracker.parked_states: [symphony/human-review]`; these states
+are observed but never dispatched. An agent entering review may finish its current turn within
+`agent.non_active_drain_timeout_ms` (default 180000), while its preset assignment remains held.
+The optional prompt context provider recognizes `symphony/todo`, `symphony/in-progress`, and
+`symphony/rework` as the todo, build, and rework phases.
 
 Assignments live in `.symphony-preset-pool.json` beside the selected workflow file, with private
 permissions and atomic replacement. Keep this file across restarts and outside Git. It contains

@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentRunner, Config, PresetPool, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.Codex.Activity
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -17,6 +18,18 @@ defmodule SymphonyElixir.Orchestrator do
   @rate_limited_retry_delay_cap_ms 600_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
+  # Semantic events only; streaming deltas never reach the trail, so this holds
+  # a meaningful stretch of history rather than a second of noise. The cap is
+  # split by class because the two kinds of event arrive at very different
+  # rates: commands, tools and searches land every few seconds, while what the
+  # agent said, what it was told and what blocked it land a few times per turn.
+  # One shared cap let a busy run of tooling evict every message; with a budget
+  # per class the tail of the trail degrades to narrative-only instead.
+  @mechanical_trail_limit 50
+  @narrative_trail_limit 30
+  @narrative_trail_kinds [:writing, :prompt, :awaiting_approval, :awaiting_input]
+  @stdout_tail_limit 2_048
+  @recent_sessions_limit 20
   @empty_codex_totals %{
     input_tokens: 0,
     output_tokens: 0,
@@ -42,6 +55,8 @@ defmodule SymphonyElixir.Orchestrator do
       claimed: MapSet.new(),
       blocked: %{},
       retry_attempts: %{},
+      recent: [],
+      observed: %{},
       codex_totals: nil,
       codex_rate_limits: nil
     ]
@@ -139,6 +154,7 @@ defmodule SymphonyElixir.Orchestrator do
       issue_id ->
         {running_entry, state} = pop_running_entry(state, issue_id)
         state = record_session_completion_totals(state, running_entry)
+        state = record_recent_session(state, issue_id, running_entry, reason)
         session_id = running_entry_session_id(running_entry)
 
         state = handle_agent_down(reason, state, issue_id, running_entry, session_id)
@@ -161,6 +177,20 @@ defmodule SymphonyElixir.Orchestrator do
           running_entry
           |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
           |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
+
+        notify_dashboard()
+        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+    end
+  end
+
+  def handle_info({:turn_prompt_archived, issue_id, ref}, %{running: running} = state)
+      when is_binary(issue_id) and is_map(ref) do
+    case Map.get(running, issue_id) do
+      nil ->
+        {:noreply, state}
+
+      running_entry ->
+        updated_running_entry = merge_activity_trail(running_entry, %{trail: prompt_trail_entry(ref)})
 
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
@@ -265,9 +295,14 @@ defmodule SymphonyElixir.Orchestrator do
       |> reconcile_blocked_issues()
 
     with :ok <- Config.validate!(),
-         {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states),
-         true <- available_slots(state) > 0 do
-      choose_issues(issues, state)
+         {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states) do
+      state = record_observed_issues(state, fetch_parked_issues() ++ issues)
+
+      if available_slots(state) > 0 do
+        choose_issues(issues, state)
+      else
+        state
+      end
     else
       {:error, :missing_linear_api_token} ->
         Logger.error("Tracker API token missing in WORKFLOW.md")
@@ -310,11 +345,83 @@ defmodule SymphonyElixir.Orchestrator do
       {:error, reason} ->
         Logger.error("Failed to fetch from issue tracker: #{inspect(reason)}")
         state
-
-      false ->
-        state
     end
   end
+
+  # Every poll already returns the issues that have no live session -- they were
+  # simply discarded. Retaining them is what lets the dashboard show work that is
+  # parked (waiting on CI, on review, on a free worker) instead of pretending the
+  # only issues that exist are the ones currently burning tokens.
+  # Issues that are running or retrying are filtered out when the snapshot is
+  # projected, not here: dispatch happens later in this same poll cycle, so
+  # anything excluded now would still be excluded a moment after it started
+  # running. Keeping every routable issue also keeps its dwell timer continuous
+  # across a session instead of restarting it as a fresh sighting.
+  defp record_observed_issues(%State{} = state, issues) when is_list(issues) do
+    now = DateTime.utc_now()
+    active_states = active_state_set()
+
+    observed =
+      issues
+      |> Enum.filter(&(match?(%Issue{}, &1) and issue_routable?(&1)))
+      |> Map.new(&{&1.id, observed_entry(state.observed, &1, now, active_states)})
+
+    %{state | observed: observed}
+  end
+
+  defp record_observed_issues(%State{} = state, _issues), do: state
+
+  # An issue that self-parks leaves the states Symphony polls, so without this
+  # it drops off the board entirely: the only trace left is the finished session
+  # that parked it, and a queue that exists to be acted on by a person reads as
+  # "finished". These are merged into the observed map and nowhere else --
+  # `choose_issues` is still handed only the active candidates, and
+  # `should_dispatch_issue?` independently requires an active state.
+  #
+  # A read failure here loses the parked lane for one cycle. Dispatch is the
+  # job, so it keeps going rather than taking the poll down with it.
+  defp fetch_parked_issues do
+    case Tracker.fetch_parked_issues() do
+      {:ok, issues} when is_list(issues) ->
+        issues
+
+      other ->
+        Logger.warning("Could not read parked issues: #{inspect(other)}")
+        []
+    end
+  end
+
+  defp observed_entry(previous, %Issue{} = issue, now, active_states) do
+    {state_since, exact?} = observed_state_since(Map.get(previous, issue.id), issue, now)
+
+    %{
+      issue_id: issue.id,
+      identifier: issue.identifier,
+      title: issue.title,
+      state: issue.state,
+      url: issue.url,
+      labels: Issue.label_names(issue),
+      state_since: state_since,
+      state_since_exact?: exact?,
+      # Issues in a state the orchestrator dispatches from are queued; the rest
+      # are parked on CI or a human. Those need different people to act, so they
+      # do not share a lane.
+      active_state?: MapSet.member?(active_states, normalize_issue_state(issue.state)),
+      last_seen_at: now
+    }
+  end
+
+  # Dwell time can only be inferred from transitions we witnessed. On the first
+  # sighting -- including every orchestrator restart -- the issue may have been
+  # parked long before, so the duration is a lower bound and is flagged as such
+  # rather than rendered as if it were exact.
+  defp observed_state_since(%{state: previous_state, state_since: since, state_since_exact?: exact?}, %Issue{} = issue, _now)
+       when previous_state == issue.state do
+    {since, exact?}
+  end
+
+  defp observed_state_since(%{}, %Issue{}, now), do: {now, true}
+  defp observed_state_since(_previous, %Issue{}, now), do: {now, false}
 
   defp reconcile_running_issues(%State{} = state) do
     state = reconcile_stalled_running_issues(state)
@@ -434,7 +541,7 @@ defmodule SymphonyElixir.Orchestrator do
 
         terminate_running_issue(state, issue.id, true)
 
-      !issue_routable?(issue) ->
+      active_issue_state?(issue.state, active_states) and !issue_routable?(issue) ->
         Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
 
         terminate_running_issue(state, issue.id, false)
@@ -443,9 +550,7 @@ defmodule SymphonyElixir.Orchestrator do
         refresh_running_issue_state(state, issue)
 
       true ->
-        Logger.info("Issue moved to non-active state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
-
-        terminate_running_issue(state, issue.id, false)
+        drain_running_issue(state, issue)
     end
   end
 
@@ -469,7 +574,7 @@ defmodule SymphonyElixir.Orchestrator do
         cleanup_issue_workspace(issue, Map.get(state.blocked, issue.id, %{}))
         release_issue_claim(state, issue.id)
 
-      !issue_routable?(issue) ->
+      active_issue_state?(issue.state, active_states) and !issue_routable?(issue) ->
         Logger.info("Blocked issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; releasing block")
         release_issue_claim(state, issue.id)
 
@@ -543,7 +648,9 @@ defmodule SymphonyElixir.Orchestrator do
   defp refresh_running_issue_state(%State{} = state, %Issue{} = issue) do
     case Map.get(state.running, issue.id) do
       %{issue: _} = running_entry ->
-        %{state | running: Map.put(state.running, issue.id, %{running_entry | issue: issue})}
+        # An issue back in an active state is no longer parked, so any pending
+        # drain deadline must not fire against the now-legitimate run.
+        put_running_entry_issue(state, issue, Map.delete(running_entry, :drain_deadline_ms))
 
       _ ->
         state
@@ -558,6 +665,58 @@ defmodule SymphonyElixir.Orchestrator do
       _ ->
         state
     end
+  end
+
+  # A worker parks its own issue (onto a CI gate, review, ...) as the last
+  # action of a turn, so a non-active state usually shows up while that same
+  # worker is still wrapping up the turn that moved it. Stopping immediately
+  # races the worker's own shutdown: the run never reports completion, the
+  # session vanishes from accounting, and the after_run hook is skipped.
+  # Instead the run drains -- the worker's own post-turn state check ends it
+  # normally -- and the deadline is the stop-loss for issues parked externally
+  # while a turn refuses to finish.
+  defp drain_running_issue(%State{} = state, %Issue{} = issue) do
+    case Map.get(state.running, issue.id) do
+      nil ->
+        release_issue_claim(state, issue.id)
+
+      running_entry ->
+        timeout_ms = Config.settings!().agent.non_active_drain_timeout_ms
+
+        if is_integer(timeout_ms) and timeout_ms > 0 do
+          advance_issue_drain(state, issue, running_entry, timeout_ms)
+        else
+          Logger.info("Issue moved to non-active state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
+
+          terminate_running_issue(state, issue.id, false)
+        end
+    end
+  end
+
+  defp advance_issue_drain(%State{} = state, %Issue{} = issue, running_entry, timeout_ms) do
+    now_ms = System.monotonic_time(:millisecond)
+    session_id = running_entry_session_id(running_entry)
+
+    case Map.get(running_entry, :drain_deadline_ms) do
+      nil ->
+        Logger.info("Issue moved to non-active state: #{issue_context(issue)} state=#{issue.state} session_id=#{session_id}; draining active agent for up to #{timeout_ms}ms")
+
+        put_running_entry_issue(state, issue, Map.put(running_entry, :drain_deadline_ms, now_ms + timeout_ms))
+
+      deadline_ms when is_integer(deadline_ms) and now_ms >= deadline_ms ->
+        Logger.warning("Drain deadline passed for non-active issue: #{issue_context(issue)} state=#{issue.state} session_id=#{session_id}; stopping active agent")
+
+        state
+        |> record_recent_session(issue.id, running_entry, :drain_timeout)
+        |> terminate_running_issue(issue.id, false)
+
+      _deadline_ms ->
+        put_running_entry_issue(state, issue, running_entry)
+    end
+  end
+
+  defp put_running_entry_issue(%State{} = state, %Issue{} = issue, running_entry) do
+    %{state | running: Map.put(state.running, issue.id, Map.put(running_entry, :issue, issue))}
   end
 
   defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace) do
@@ -992,6 +1151,8 @@ defmodule SymphonyElixir.Orchestrator do
 
         Logger.info("Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
 
+        started_at = DateTime.utc_now()
+
         running =
           Map.put(state.running, issue.id, %{
             pid: pid,
@@ -1013,7 +1174,13 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_total_tokens: 0,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
-            started_at: DateTime.utc_now()
+            started_at: started_at,
+            activity: Activity.initial(started_at),
+            last_progress_at: started_at,
+            activity_trail: [],
+            plan: nil,
+            diff_stats: nil,
+            stdout_tail: ""
           })
 
         %{
@@ -1487,6 +1654,7 @@ defmodule SymphonyElixir.Orchestrator do
           issue_id: issue_id,
           identifier: metadata.identifier,
           issue_url: metadata.issue.url,
+          title: metadata.issue.title,
           state: metadata.issue.state,
           worker_host: Map.get(metadata, :worker_host),
           workspace_path: Map.get(metadata, :workspace_path),
@@ -1500,7 +1668,13 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_timestamp: metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,
           last_codex_event: metadata.last_codex_event,
-          runtime_seconds: running_seconds(metadata.started_at, now)
+          runtime_seconds: running_seconds(metadata.started_at, now),
+          activity: Map.get(metadata, :activity),
+          last_progress_at: Map.get(metadata, :last_progress_at),
+          activity_trail: Map.get(metadata, :activity_trail, []),
+          plan: Map.get(metadata, :plan),
+          diff_stats: Map.get(metadata, :diff_stats),
+          stdout_tail: Map.get(metadata, :stdout_tail, "")
         }
       end)
 
@@ -1538,12 +1712,27 @@ defmodule SymphonyElixir.Orchestrator do
         }
       end)
 
+    observed =
+      state.observed
+      |> Map.values()
+      |> Enum.reject(&(Map.has_key?(state.running, &1.issue_id) or Map.has_key?(state.retry_attempts, &1.issue_id) or Map.has_key?(state.blocked, &1.issue_id)))
+      |> Enum.map(&Map.put(&1, :state_seconds, running_seconds(&1.state_since, now)))
+      |> Enum.sort_by(& &1.state_seconds, :desc)
+
     {:reply,
      %{
        preset_environments: Map.values(PresetPool.records()),
        running: running,
        retrying: retrying,
        blocked: blocked,
+       recent: state.recent,
+       observed: observed,
+       # The team's declared pipeline order, so the dashboard groups live
+       # sessions by workflow stage without hardcoding this team's state names.
+       active_states: Config.settings!().tracker.active_states,
+       # Same reason, for the states that are watched but never dispatched: the
+       # declared order puts the most actionable queue at the top of the rail.
+       parked_states: Config.settings!().tracker.parked_states,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{
@@ -1587,7 +1776,9 @@ defmodule SymphonyElixir.Orchestrator do
     turn_count = Map.get(running_entry, :turn_count, 0)
 
     {
-      Map.merge(running_entry, %{
+      running_entry
+      |> apply_activity_effects(update, timestamp)
+      |> Map.merge(%{
         last_codex_timestamp: timestamp,
         last_codex_message: summarize_codex_update(update),
         session_id: session_id_for_update(running_entry.session_id, update),
@@ -1603,6 +1794,125 @@ defmodule SymphonyElixir.Orchestrator do
       }),
       token_delta
     }
+  end
+
+  # Every codex event -- streaming deltas included -- proves the session is
+  # still alive, so all of them refresh the heartbeat. Only the semantic ones
+  # are allowed to change what the session is reported to be doing.
+  defp apply_activity_effects(running_entry, update, timestamp) do
+    effects = Activity.observe(update)
+    progress_at = timestamp || DateTime.utc_now()
+
+    running_entry
+    |> Map.put(:last_progress_at, progress_at)
+    |> merge_activity(effects)
+    |> merge_activity_trail(effects)
+    |> merge_effect(effects, :plan, :plan)
+    |> merge_effect(effects, :diff, :diff_stats)
+    |> merge_stdout_tail(effects)
+  end
+
+  defp merge_activity(running_entry, %{activity: activity}) do
+    current = Map.get(running_entry, :activity)
+    Map.put(running_entry, :activity, Activity.advance(current, activity))
+  end
+
+  defp merge_activity(running_entry, _effects), do: running_entry
+
+  defp merge_activity_trail(running_entry, %{trail: entry}) do
+    trail =
+      running_entry
+      |> Map.get(:activity_trail, [])
+      |> then(&[entry | &1])
+      |> cap_activity_trail()
+
+    Map.put(running_entry, :activity_trail, trail)
+  end
+
+  defp merge_activity_trail(running_entry, _effects), do: running_entry
+
+  # Walks newest-first and keeps the first N of each class, so relative order
+  # within the trail is preserved and eviction always drops the oldest entry
+  # of whichever class is over its budget.
+  defp cap_activity_trail(trail) do
+    trail
+    |> Enum.reduce({[], 0, 0}, fn entry, {kept, narrative, mechanical} ->
+      cond do
+        narrative_trail_entry?(entry) and narrative < @narrative_trail_limit ->
+          {[entry | kept], narrative + 1, mechanical}
+
+        not narrative_trail_entry?(entry) and mechanical < @mechanical_trail_limit ->
+          {[entry | kept], narrative, mechanical + 1}
+
+        true ->
+          {kept, narrative, mechanical}
+      end
+    end)
+    |> elem(0)
+    |> Enum.reverse()
+  end
+
+  defp narrative_trail_entry?(%{kind: kind}), do: kind in @narrative_trail_kinds
+  defp narrative_trail_entry?(_entry), do: false
+
+  # The trail carries the archive reference, not the prompt itself: a snapshot
+  # ships to every connected dashboard on each event, and a 40KB prompt riding
+  # along would dwarf everything else in it.
+  defp prompt_trail_entry(ref) do
+    %{
+      at: Map.get(ref, :at) || DateTime.utc_now(),
+      kind: :prompt,
+      title: "Turn #{Map.get(ref, :turn)} prompt injected",
+      meta: nil,
+      prompt: %{
+        identifier: Map.get(ref, :identifier),
+        basename: Map.get(ref, :basename),
+        turn: Map.get(ref, :turn),
+        chars: Map.get(ref, :chars)
+      }
+    }
+  end
+
+  defp merge_effect(running_entry, effects, effect_key, entry_key) do
+    case Map.fetch(effects, effect_key) do
+      {:ok, value} -> Map.put(running_entry, entry_key, value)
+      :error -> running_entry
+    end
+  end
+
+  defp merge_stdout_tail(running_entry, %{stdout: chunk}) do
+    tail =
+      running_entry
+      |> Map.get(:stdout_tail, "")
+      |> Kernel.<>(chunk)
+      |> trim_stdout_tail()
+
+    Map.put(running_entry, :stdout_tail, tail)
+  end
+
+  defp merge_stdout_tail(running_entry, _effects), do: running_entry
+
+  # Build output can be arbitrarily large; only the visible tail is worth
+  # keeping resident per session.
+  defp trim_stdout_tail(tail) when byte_size(tail) <= @stdout_tail_limit, do: tail
+
+  defp trim_stdout_tail(tail) do
+    tail
+    |> binary_part(byte_size(tail) - @stdout_tail_limit, @stdout_tail_limit)
+    |> sanitize_trimmed_stdout()
+  end
+
+  # Slicing by bytes can cut a multi-byte grapheme in half; drop the partial
+  # leading codepoint rather than emit invalid UTF-8 to the dashboard.
+  defp sanitize_trimmed_stdout(tail) do
+    if String.valid?(tail) do
+      tail
+    else
+      case tail do
+        <<_byte, rest::binary>> -> sanitize_trimmed_stdout(rest)
+        _ -> ""
+      end
+    end
   end
 
   defp codex_app_server_pid_for_update(_existing, %{codex_app_server_pid: pid})
@@ -1698,6 +2008,49 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp record_session_completion_totals(state, _running_entry), do: state
+
+  # A session vanishes from `running` the moment its task exits, which used to
+  # make "what did the agent just do?" unanswerable -- the most useful question
+  # when an issue lands in review or retry. Keep a bounded tail of finished
+  # sessions so the dashboard can still answer it.
+  defp record_recent_session(%State{} = state, issue_id, running_entry, reason) when is_map(running_entry) do
+    finished_at = DateTime.utc_now()
+    started_at = Map.get(running_entry, :started_at)
+
+    entry = %{
+      issue_id: issue_id,
+      identifier: Map.get(running_entry, :identifier),
+      title: running_entry |> Map.get(:issue) |> issue_title(),
+      outcome: if(reason == :normal, do: :completed, else: :failed),
+      reason: recent_session_reason(reason),
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path),
+      session_id: Map.get(running_entry, :session_id),
+      turn_count: Map.get(running_entry, :turn_count, 0),
+      started_at: started_at,
+      finished_at: finished_at,
+      runtime_seconds: running_seconds(started_at, finished_at),
+      tokens: %{
+        input_tokens: Map.get(running_entry, :codex_input_tokens, 0),
+        output_tokens: Map.get(running_entry, :codex_output_tokens, 0),
+        total_tokens: Map.get(running_entry, :codex_total_tokens, 0)
+      },
+      last_activity: Map.get(running_entry, :activity),
+      activity_trail: Map.get(running_entry, :activity_trail, []),
+      plan: Map.get(running_entry, :plan),
+      diff_stats: Map.get(running_entry, :diff_stats)
+    }
+
+    %{state | recent: Enum.take([entry | state.recent], @recent_sessions_limit)}
+  end
+
+  defp record_recent_session(state, _issue_id, _running_entry, _reason), do: state
+
+  defp recent_session_reason(:normal), do: nil
+  defp recent_session_reason(reason), do: inspect(reason)
+
+  defp issue_title(%Issue{title: title}), do: title
+  defp issue_title(_issue), do: nil
 
   defp refresh_runtime_config(%State{} = state) do
     config = Config.settings!()
