@@ -182,6 +182,20 @@ defmodule SymphonyElixir.PresetPoolTest do
     assert {:error, _} = PresetPool.reserve(issue("1"))
   end
 
+  test "terminal reconciliation preserves ownership when cleanup fails", %{env: env} do
+    owner = issue("cleanup-failure")
+    assert {:ok, ^env} = PresetPool.reserve(owner)
+    assert :ok = Workspace.run_before_run_hook(env, owner)
+    File.write!(Path.join(env, "dev/job.sh"), "#!/bin/sh\nexit 1\n")
+    File.chmod!(Path.join(env, "dev/job.sh"), 0o755)
+
+    assert {:error, {:preset_job_failed, "cleanup", 1}, ^env} = PresetPool.release_issue_result(owner)
+    assert PresetPool.assigned?(owner)
+    File.write!(Path.join(env, "dev/job.sh"), "#!/bin/sh\nexit 0\n")
+    File.chmod!(Path.join(env, "dev/job.sh"), 0o755)
+    assert :ok = PresetPool.release_issue(owner)
+  end
+
   test "review drains a preset worker without releasing its environment", %{root: root, env: env} do
     configure(root, ["apa-02"], tracker_kind: "memory", tracker_active_states: ["symphony/in-progress"], tracker_parked_states: ["symphony/human-review"])
     owner = %Issue{id: "43", identifier: "GT-43", title: "Review handoff", state: "symphony/in-progress", dispatchable: true}

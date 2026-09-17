@@ -1376,7 +1376,16 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp cleanup_terminal_preset(issue, state) do
     if terminal_issue_state?(issue.state, terminal_state_set()) and not Map.has_key?(state.running, issue.id) do
-      PresetPool.release_issue(issue)
+      case PresetPool.release_issue_result(issue) do
+        :ok ->
+          :ok
+
+        {:ok, _} ->
+          :ok
+
+        {:error, reason, path} ->
+          Logger.warning("Preset cleanup retained ownership issue_id=#{issue.id} issue_identifier=#{issue.identifier} path=#{path} reason=#{inspect(reason)}")
+      end
     end
   end
 

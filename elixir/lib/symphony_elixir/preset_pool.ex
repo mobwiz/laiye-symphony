@@ -98,12 +98,16 @@ defmodule SymphonyElixir.PresetPool do
 
   @spec release_issue(map() | String.t()) :: :ok
   def release_issue(issue) do
+    _ = release_issue_result(issue)
+    :ok
+  end
+
+  @spec release_issue_result(map() | String.t()) :: :ok | {:error, term(), String.t()}
+  def release_issue_result(issue) do
     case records()[identity(issue)] do
       %{"path" => path} -> release(path)
       nil -> :ok
     end
-
-    :ok
   end
 
   defp allocate(entries, key, issue) do
