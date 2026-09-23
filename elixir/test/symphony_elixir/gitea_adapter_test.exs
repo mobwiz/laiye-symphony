@@ -131,7 +131,7 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
     assert unknown.state == "state/backlog"
   end
 
-  test "client warns and uses the first recognized state label" do
+  test "client does not dispatch conflicting state labels" do
     log =
       capture_log(fn ->
         issue =
@@ -140,9 +140,20 @@ defmodule SymphonyElixir.Gitea.AdapterTest do
           |> GiteaClient.normalize_issue_for_test("octo/repo")
 
         assert issue.state == "state/todo"
+        refute issue.dispatchable
       end)
 
     assert log =~ "Multiple Gitea state labels issue_index=22 count=2"
+  end
+
+  test "client does not dispatch a pull request returned by the issue endpoint" do
+    issue =
+      raw_issue(25)
+      |> with_state_labels(["state/todo"])
+      |> Map.put("pull_request", %{"merged" => false})
+      |> GiteaClient.normalize_issue_for_test("octo/repo")
+
+    refute issue.dispatchable
   end
 
   test "closed issues with nonterminal labels are not dispatchable" do

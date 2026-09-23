@@ -58,8 +58,11 @@ defmodule SymphonyElixir.Tracker.Issue do
   def routable?(%__MODULE__{dispatchable: true, labels: labels}, required_labels, active_labels)
       when is_list(labels) and is_list(required_labels) and is_list(active_labels) do
     issue_labels = MapSet.new(labels, &normalize_label/1)
+    required_route? = Enum.any?(required_labels, &String.starts_with?(normalize_label(&1), "route/"))
+    route_count = Enum.count(issue_labels, &String.starts_with?(&1, "route/"))
 
-    Enum.all?(required_labels, &MapSet.member?(issue_labels, normalize_label(&1))) and
+    (not required_route? or route_count == 1) and
+      Enum.all?(required_labels, &MapSet.member?(issue_labels, normalize_label(&1))) and
       (active_labels == [] or
          Enum.any?(active_labels, &MapSet.member?(issue_labels, normalize_label(&1))))
   end

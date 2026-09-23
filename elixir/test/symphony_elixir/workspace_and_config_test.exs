@@ -434,6 +434,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Issue.routable?(issue, [], [])
     assert Issue.routable?(issue, [], ["status/todo", "status/rework"])
     assert Issue.routable?(issue, ["backend"], ["status/todo"])
+    assert Issue.routable?(%{issue | labels: ["route/linux", "status/todo"]}, ["route/linux"], ["status/todo"])
+    refute Issue.routable?(%{issue | labels: ["route/linux", "route/client", "status/todo"]}, ["route/linux"], ["status/todo"])
     refute Issue.routable?(issue, [], ["status/merging"])
     refute Issue.routable?(issue, ["missing"], ["status/todo"])
     refute Issue.routable?(%{issue | dispatchable: false}, [], ["status/todo"])

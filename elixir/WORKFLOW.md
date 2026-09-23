@@ -4,6 +4,7 @@ tracker:
   provider:
     project_slug: "symphony-0c79b11b75ea"
   required_labels: []
+  # If a route/... label is required, only issues with exactly one route label dispatch.
   active_states:
     - Todo
     - In Progress
