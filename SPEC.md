@@ -782,14 +782,15 @@ An issue is dispatch-eligible only if all are true:
 - Its state is in `active_states` and not in `terminal_states`.
 - Its adapter-provided `dispatchable` value is `true`.
 - It contains every label in `tracker.required_labels`.
+- When a required label uses the `route/` prefix, it has exactly one `route/...` label.
 - It is not already in `running`.
 - It is not already in `claimed`.
 - Global concurrency slots are available.
 - Per-state concurrency slots are available.
 
 For refresh and continuation checks, `issue_routable(issue)` means only that adapter-provided
-`dispatchable` is true and all `tracker.required_labels` match. State, claims, and concurrency are
-checked separately by the surrounding algorithm.
+`dispatchable` is true, all `tracker.required_labels` match, and a configured route is unique.
+State, claims, and concurrency are checked separately by the surrounding algorithm.
 
 Sorting order (stable intent):
 

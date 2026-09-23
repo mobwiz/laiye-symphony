@@ -46,3 +46,7 @@ The Elixir implementation optionally assigns prebuilt local environments instead
 workspace for each issue. An issue keeps its environment through retries, review and restarts;
 terminal cleanup releases ownership without deleting the directory. See
 [the preset configuration and lifecycle contract](elixir/README.md#preset-environment-pool).
+
+For Gitea trackers, a required `route/...` label must be the issue's only route
+label. Pull requests and issues with conflicting workflow state labels are not
+dispatched.

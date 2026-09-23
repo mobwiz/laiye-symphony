@@ -140,6 +140,7 @@ defmodule SymphonyElixir.Gitea.Client do
     normalized_labels = labels(issue)
     workflow_state = issue_state(normalized_labels, index)
     native_state = state(issue["state"])
+    state_label_count = Enum.count(normalized_labels, &MapSet.member?(@states, &1))
 
     if is_integer(index) and index > 0 and present_string?(issue["title"]) and present_string?(issue["state"]),
       do: %Issue{
@@ -153,7 +154,9 @@ defmodule SymphonyElixir.Gitea.Client do
         assignee_id: assignee_id(issue),
         labels: normalized_labels,
         blocked_by: [],
-        dispatchable: native_state == "open" or MapSet.member?(@terminal_states, workflow_state),
+        dispatchable:
+          is_nil(issue["pull_request"]) and state_label_count <= 1 and
+            (native_state == "open" or MapSet.member?(@terminal_states, workflow_state)),
         created_at: datetime(issue["created_at"]),
         updated_at: datetime(issue["updated_at"])
       }

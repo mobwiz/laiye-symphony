@@ -155,6 +155,8 @@ Notes:
 - `tracker.required_labels` is optional. When set, an issue must have every
   configured label to dispatch or continue running. Label matching ignores
   case and surrounding whitespace. A blank configured label matches no issue.
+  If a required label starts with `route/`, the issue must have exactly one
+  `route/...` label.
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
@@ -305,6 +307,8 @@ codex:
   `state/backlog`, `state/todo`, `state/in-progress`, `state/human-review`,
   `state/rework`, `state/merging`, `state/canceled`, `state/duplicated`, and
   `state/done`; missing or unknown state labels default to `state/backlog`.
+  Pull requests and issues with multiple recognized workflow state labels are
+  not dispatchable.
   Nonterminal state reads query open Gitea issues, terminal state reads query
   closed issues, and mixed reads query all issues before exact label-state
   filtering. A closed issue carrying a nonterminal label is not dispatchable.
